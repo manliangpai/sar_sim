@@ -1,0 +1,43 @@
+# --- 仿真/后处理产物（体积大，可本地重新生成）---
+output/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# --- 虚拟环境 ---
+.venv/
+venv/
+env/
+.env/
+
+# --- 测试 / 类型检查 / 覆盖率 ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- 打包（若将来发布为包）---
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# --- IDE / 编辑器 ---
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- 操作系统 ---
+.DS_Store
+Thumbs.db
+desktop.ini
