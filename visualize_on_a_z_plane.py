@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
 """
-运行示例（在仓库根目录执行）::
+运行示例（在 sar_sim 仓库根目录执行）::
 
-  python sar_sim/visualize_on_a_z_plane.py
-
-  # 凹室墙 raw + 后墙 z=3 m：先改本文件 DEFAULT_NPZ 与 Z_PLANE_M，再运行上面命令。
-  # 或::
-  #   python -c "from pathlib import Path; from sar_sim.visualize_on_a_z_plane import run_z_plane_view; from sar_sim.simulate import RAW_RADAR_DIR; run_z_plane_view(RAW_RADAR_DIR/'ti1843_2t4r_concave_room.npz', z_m=3.0)"
+  python visualize_on_a_z_plane.py
+  python visualize_on_a_z_plane.py --npz output/raw_radar_data_z0.6/0.npz
+  python visualize_on_a_z_plane.py --npz output/raw_radar_data_z0.6/A.npz --z 0.6
 
 SAR 立方体可视化：距离 FFT + 固定 z 平面双基地后向投影。
 
-模块文件：visualize_on_a_z_plane.py
-
-默认读取 sar_sim/output/raw_radar_data/ti1843_2t4r_two_corner_reflectors.npz，
-使用 sar_sim.config 中的 2TX×4RX 阵列与转台参数。
-
-成像/显示默认与 TI1843 reproduce 一致：z=2 m，x/y∈[-2,2] m、步长 10 cm，
-线性色标 [0, 峰值]（display_floor_ratio=0），imshow interpolation='nearest'。
+默认读取 output/raw_radar_data_z0.6/0.npz，在 z=0.6 m、±10 cm 网格上成像。
+阵列与转台参数来自 sar_sim.config（2TX×4RX）。
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -37,24 +31,27 @@ import numpy as np
 from sar_sim.config import (
     ArrayConfig,
     C_LIGHT,
+    PIXEL_CELL_M,
+    PIXEL_GRID_N,
+    PIXEL_PLANE_SIZE_M,
+    PIXEL_PLANE_Z_M,
     RadarConfig,
     SarRotationConfig,
     channel_tx_rx_index,
     rx_positions_at_stop,
     tx_positions_at_stop,
 )
-from sar_sim.config import scene_output_filename
-from sar_sim.process_alpha_beta_z import load_sar_cube
-from sar_sim.simulate import RAW_RADAR_DIR
+from sar_sim.simulate_pics import RAW_RADAR_DIR, load_sar_cube
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
-DEFAULT_NPZ = RAW_RADAR_DIR / scene_output_filename("two_corners")
+DEFAULT_NPZ = RAW_RADAR_DIR / "0.npz"
 
-# z=2 m 成像网格（与 TI1843 reproduce / visualize_ti1843_sar 一致）
-Z_PLANE_M = 2.0
-XY_MIN_M = -2.0
-XY_MAX_M = 2.0
-XY_STEP_M = 0.05
+# pixel_pattern 默认：z=0.6 m，20×20 @ 1 cm（±10 cm）
+Z_PLANE_M = PIXEL_PLANE_Z_M
+XY_HALF_M = PIXEL_PLANE_SIZE_M * 0.5
+XY_MIN_M = -XY_HALF_M
+XY_MAX_M = XY_HALF_M
+XY_STEP_M = PIXEL_CELL_M
 
 _CJK_FONT_CANDIDATES = (
     "Microsoft YaHei",
@@ -97,7 +94,15 @@ def imaging_grid_axes(
     xy_min: float = XY_MIN_M,
     xy_max: float = XY_MAX_M,
     step: float = XY_STEP_M,
+    n: int | None = PIXEL_GRID_N,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """格心坐标轴；默认 20×20 pixel_pattern 网格。"""
+    if n is not None:
+        half = n * step * 0.5
+        axis = (-half + (np.arange(n, dtype=np.float64) + 0.5) * step).astype(
+            np.float64
+        )
+        return axis, axis.copy()
     x_axis = np.arange(xy_min, xy_max + 0.5 * step, step, dtype=np.float64)
     y_axis = np.arange(xy_min, xy_max + 0.5 * step, step, dtype=np.float64)
     return x_axis, y_axis
@@ -310,7 +315,22 @@ def run_z_plane_view(
 
 
 def main() -> None:
-    run_z_plane_view()
+    parser = argparse.ArgumentParser(description="SAR raw cube → z 平面后向投影")
+    parser.add_argument(
+        "--npz",
+        type=Path,
+        default=DEFAULT_NPZ,
+        help=f"raw SAR npz 路径（默认 {DEFAULT_NPZ}）",
+    )
+    parser.add_argument(
+        "--z",
+        type=float,
+        default=Z_PLANE_M,
+        metavar="M",
+        help=f"成像 z 平面 (m)，默认 {Z_PLANE_M}",
+    )
+    args = parser.parse_args()
+    run_z_plane_view(npz_path=args.npz, z_m=args.z)
 
 
 if __name__ == "__main__":

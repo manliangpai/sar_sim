@@ -1,6 +1,11 @@
 # --- 仿真/后处理产物（体积大，可本地重新生成）---
 output/
 
+# --- 训练产物 ---
+train/checkpoints/
+train/runs/
+.cache/
+
 # --- Python ---
 __pycache__/
 *.py[cod]

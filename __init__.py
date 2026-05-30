@@ -6,13 +6,13 @@ from sar_sim.config import (
     SarRotationConfig,
     channel_tx_rx_index,
     PointTarget,
+    pixel_pattern_scene,
     rx_positions,
     rx_positions_at_stop,
     tx_positions,
     tx_positions_at_stop,
-    two_corner_reflector_scene,
 )
-from sar_sim.simulate import simulate_sar_rotation_cube, save_raw_cube
+from sar_sim.simulate_pics import load_sar_cube, save_raw_cube, simulate_sar_rotation_cube
 
 __all__ = [
     "ArrayConfig",
@@ -20,11 +20,12 @@ __all__ = [
     "RadarConfig",
     "PointTarget",
     "channel_tx_rx_index",
+    "pixel_pattern_scene",
     "rx_positions",
     "rx_positions_at_stop",
     "tx_positions",
     "tx_positions_at_stop",
-    "two_corner_reflector_scene",
+    "load_sar_cube",
     "simulate_sar_rotation_cube",
     "save_raw_cube",
 ]

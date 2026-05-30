@@ -1,0 +1,22 @@
+{
+  "sources": [
+    {
+      "processed_dir": "output/processed_radar_data_z0.6",
+      "gt_dir": "output/pics"
+    }
+  ],
+  "val_ratio": 0.3,
+  "model": {
+    "base_channels": 32
+  },
+  "train": {
+    "epochs": 200,
+    "batch_size": 8,
+    "lr": 0.001,
+    "weight_decay": 0.0001,
+    "seed": 42,
+    "log1p": true
+  },
+  "checkpoint_dir": "train/checkpoints",
+  "runs_dir": "train/runs"
+}
