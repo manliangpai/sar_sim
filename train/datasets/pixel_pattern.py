@@ -1,4 +1,4 @@
-"""processed BP magnitude (20×20) ↔ pics GT npy (20×20) 配对 Dataset。"""
+"""processed BP magnitude (N×N) ↔ pics GT npy (N×N) 配对 Dataset。"""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from sar_sim.config.scene import DEFAULT_PATTERN_PICS_DIR, load_pixel_pattern_gt
+from sar_sim.config.scene import DEFAULT_PATTERN_PICS_DIR, load_pixel_pattern_gt, radar_data_z_dir
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_PROCESSED_DIR = _PACKAGE_ROOT / "output" / "processed_radar_data_z0.6"
+DEFAULT_PROCESSED_DIR = radar_data_z_dir("processed_radar_data")
 DEFAULT_GT_DIR = DEFAULT_PATTERN_PICS_DIR
 
 
@@ -114,7 +114,9 @@ def split_samples_random(
         raise ValueError(f"val_ratio 须在 (0,1) 内，得到 {val_ratio}")
     items = sorted(samples, key=lambda s: s.name)
     if len(items) < 2:
-        raise ValueError("至少需要 2 个配对样本才能划分训练/验证")
+        if len(items) == 1:
+            return list(items), list(items)
+        raise ValueError("至少需要 1 个配对样本才能划分训练/验证")
     rng = random.Random(seed)
     order = list(range(len(items)))
     rng.shuffle(order)

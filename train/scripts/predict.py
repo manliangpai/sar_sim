@@ -4,7 +4,7 @@
 
 运行::
 
-  python train/scripts/predict.py --pattern 0
+  python train/scripts/predict.py --pattern circle
   python train/scripts/predict.py --pattern 8 --gpu
   python train/scripts/predict.py --val --gpu
 """
@@ -88,7 +88,7 @@ def main() -> None:
         nargs="*",
         default=None,
         metavar="NAME",
-        help="图案名（可多个）；默认 0",
+        help="图案名（可多个）；默认 circle",
     )
     parser.add_argument(
         "--val",
@@ -128,7 +128,7 @@ def main() -> None:
     else:
         processed_dir, gt_dir = default_source(cfg)
         jobs = [
-            PatternSample(name="0", processed_dir=processed_dir, gt_dir=gt_dir)
+            PatternSample(name="circle", processed_dir=processed_dir, gt_dir=gt_dir)
         ]
 
     device = get_device(prefer_cuda=args.gpu and not args.cpu)

@@ -1,7 +1,7 @@
 {
   "sources": [
     {
-      "processed_dir": "output/processed_radar_data_z0.6",
+      "processed_dir": "output/processed_radar_data_z0.5",
       "gt_dir": "output/pics"
     }
   ],

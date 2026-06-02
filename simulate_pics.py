@@ -8,7 +8,7 @@ pixel_pattern SAR FMCW 前向仿真与批量采集。
 
   python simulate_pics.py --gpu
   python simulate_pics.py --skip-existing
-  python simulate_pics.py --pattern 0 A
+  python simulate_pics.py --pattern circle
 """
 
 from __future__ import annotations
@@ -46,10 +46,11 @@ from sar_sim.config.scene import (
     DEFAULT_CUBE_SUBDIV,
     DEFAULT_PATTERN_PICS_DIR,
     pixel_pattern_names,
+    radar_data_z_dir,
 )
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
-RAW_RADAR_ROOT = _PACKAGE_ROOT / "output" / "raw_radar_data_z0.6"
+RAW_RADAR_ROOT = radar_data_z_dir("raw_radar_data")
 RAW_RADAR_DIR = RAW_RADAR_ROOT
 DEFAULT_PICS_DIR = DEFAULT_PATTERN_PICS_DIR
 DEFAULT_OUTPUT_DIR = RAW_RADAR_DIR
@@ -96,6 +97,7 @@ def _simulate_channels_for_one_tx(
     targets: Sequence[PointTarget],
     tx_pos: np.ndarray,
     rx_positions: np.ndarray,
+    antenna_angle_deg: float,
     c: float = C_LIGHT,
 ) -> np.ndarray:
     """单 TX → (n_rx, n_adc) complex64。"""
@@ -132,7 +134,13 @@ def _simulate_channels_for_one_tx(
         if radar.use_antenna_pattern:
             gains = np.empty(targets_xyz.shape[0], dtype=np.float64)
             for i, tgt in enumerate(targets_xyz):
-                g, _, _ = monostatic_channel_gain(tx_pos, ant, tgt, pattern)
+                g, _, _ = monostatic_channel_gain(
+                    tx_pos,
+                    ant,
+                    tgt,
+                    pattern,
+                    antenna_angle_deg=antenna_angle_deg,
+                )
                 gains[i] = g
         else:
             gains = np.ones(targets_xyz.shape[0], dtype=np.float64)
@@ -154,13 +162,20 @@ def _simulate_one_stop(
     c: float = C_LIGHT,
 ) -> np.ndarray:
     """一个停点：TX1 + TX2 → (8, n_adc)。"""
+    antenna_angle_deg = angle_deg_at_stop(stop_index, rotation)
     tx_pos = tx_positions_at_stop(array, stop_index, rotation)
     rx_pos = rx_positions_at_stop(array, stop_index, rotation)
     frame = np.zeros((array.n_channels, radar.n_adc_samples), dtype=np.complex64)
 
     for tx_i in range(array.n_tx):
         block = _simulate_channels_for_one_tx(
-            radar, array, targets, tx_pos[tx_i], rx_pos, c=c
+            radar,
+            array,
+            targets,
+            tx_pos[tx_i],
+            rx_pos,
+            antenna_angle_deg,
+            c=c,
         )
         frame[tx_i * array.n_rx : (tx_i + 1) * array.n_rx, :] = block
 
@@ -178,7 +193,8 @@ class _GpuSimState:
     use_antenna_pattern: bool
     half_az_rad: float
     half_el_rad: float
-    cutoff_multiplier: float
+    beta_az: float
+    beta_el: float
     device: object
 
 
@@ -208,21 +224,32 @@ def _try_create_gpu_sim_state(
         slope_hz_per_s=radar.slope_hz_per_s,
         c_light=c,
         use_antenna_pattern=radar.use_antenna_pattern,
-        half_az_rad=math.radians(pattern.half_angle_az_deg),
-        half_el_rad=math.radians(pattern.half_angle_el_deg),
-        cutoff_multiplier=pattern.cutoff_multiplier,
+        half_az_rad=math.radians(pattern.hp_az_deg),
+        half_el_rad=math.radians(pattern.hp_el_deg),
+        beta_az=pattern.az_beam_beta,
+        beta_el=pattern.el_beam_beta,
         device=dev,
     )
 
 
-def _axis_gain_torch(angle_rad, half_angle_rad: float, cutoff_multiplier: float):
+def _axis_gain_torch(angle_rad, half_power_rad: float, beta: float):
     import torch
 
-    if half_angle_rad <= 0:
+    if half_power_rad <= 0:
         return torch.zeros_like(angle_rad)
-    normalized = torch.abs(angle_rad) / half_angle_rad
-    out = torch.cos(math.pi * normalized / 4.0) ** 2
-    return torch.where(normalized >= cutoff_multiplier, torch.zeros_like(out), out)
+    normalized = torch.abs(angle_rad) / half_power_rad
+    x = torch.pow(normalized, beta) * (math.pi / 4.0)
+    out = torch.cos(x) ** 2
+    return torch.where(x >= math.pi / 2.0, torch.zeros_like(out), out)
+
+
+def _rotate_delta_body_torch(dx, dy, dz, antenna_angle_deg: float):
+    import torch
+
+    theta = math.radians(antenna_angle_deg)
+    c = math.cos(theta)
+    s = math.sin(theta)
+    return c * dx + s * dy, -s * dx + c * dy, dz
 
 
 def _direction_gain_torch(
@@ -230,17 +257,20 @@ def _direction_gain_torch(
     targets_xyz,
     half_az_rad: float,
     half_el_rad: float,
-    cutoff_multiplier: float,
+    beta_az: float,
+    beta_el: float,
+    antenna_angle_deg: float,
 ):
     import torch
 
     diff = targets_xyz - ant_xyz
     dx, dy, dz = diff[:, 0], diff[:, 1], diff[:, 2]
+    dx, dy, dz = _rotate_delta_body_torch(dx, dy, dz, antenna_angle_deg)
     ground = torch.sqrt(dx * dx + dz * dz)
     az = torch.atan2(dx, dz)
     el = torch.atan2(dy, ground)
-    return _axis_gain_torch(az, half_az_rad, cutoff_multiplier) * _axis_gain_torch(
-        el, half_el_rad, cutoff_multiplier
+    return _axis_gain_torch(az, half_az_rad, beta_az) * _axis_gain_torch(
+        el, half_el_rad, beta_el
     )
 
 
@@ -249,17 +279,20 @@ def _direction_gain_rx_torch(
     targets_xyz,
     half_az_rad: float,
     half_el_rad: float,
-    cutoff_multiplier: float,
+    beta_az: float,
+    beta_el: float,
+    antenna_angle_deg: float,
 ):
     import torch
 
     diff = targets_xyz[:, None, :] - rx_xyz[None, :, :]
     dx, dy, dz = diff[..., 0], diff[..., 1], diff[..., 2]
+    dx, dy, dz = _rotate_delta_body_torch(dx, dy, dz, antenna_angle_deg)
     ground = torch.sqrt(dx * dx + dz * dz)
     az = torch.atan2(dx, dz)
     el = torch.atan2(dy, ground)
-    return _axis_gain_torch(az, half_az_rad, cutoff_multiplier) * _axis_gain_torch(
-        el, half_el_rad, cutoff_multiplier
+    return _axis_gain_torch(az, half_az_rad, beta_az) * _axis_gain_torch(
+        el, half_el_rad, beta_el
     )
 
 
@@ -267,6 +300,7 @@ def _simulate_channels_for_one_tx_gpu(
     gpu: _GpuSimState,
     tx_pos: np.ndarray,
     rx_positions: np.ndarray,
+    antenna_angle_deg: float,
 ) -> np.ndarray:
     import torch
 
@@ -293,14 +327,18 @@ def _simulate_channels_for_one_tx_gpu(
             gpu.targets_xyz,
             gpu.half_az_rad,
             gpu.half_el_rad,
-            gpu.cutoff_multiplier,
+            gpu.beta_az,
+            gpu.beta_el,
+            antenna_angle_deg,
         )
         g_rx = _direction_gain_rx_torch(
             rx,
             gpu.targets_xyz,
             gpu.half_az_rad,
             gpu.half_el_rad,
-            gpu.cutoff_multiplier,
+            gpu.beta_az,
+            gpu.beta_el,
+            antenna_angle_deg,
         )
         gains = torch.sqrt(g_tx[:, None] * g_rx)
     else:
@@ -317,11 +355,14 @@ def _simulate_one_stop_gpu(
     stop_index: int,
     rotation: SarRotationConfig,
 ) -> np.ndarray:
+    antenna_angle_deg = angle_deg_at_stop(stop_index, rotation)
     tx_pos = tx_positions_at_stop(array, stop_index, rotation)
     rx_pos = rx_positions_at_stop(array, stop_index, rotation)
     frame = np.zeros((array.n_channels, gpu.t_adc.shape[0]), dtype=np.complex64)
     for tx_i in range(array.n_tx):
-        block = _simulate_channels_for_one_tx_gpu(gpu, tx_pos[tx_i], rx_pos)
+        block = _simulate_channels_for_one_tx_gpu(
+            gpu, tx_pos[tx_i], rx_pos, antenna_angle_deg
+        )
         frame[tx_i * array.n_rx : (tx_i + 1) * array.n_rx, :] = block
     return frame
 
@@ -471,14 +512,14 @@ def simulate_one(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="批量 pixel_pattern 仿真 → output/raw_radar_data_z0.6"
+        description="批量 pixel_pattern 仿真 → output/raw_radar_data_z*"
     )
     parser.add_argument(
         "--pattern",
         nargs="*",
         default=None,
         metavar="NAME",
-        help="图案名（默认 output/pics 下全部）",
+        help="图案名（默认 circle）",
     )
     parser.add_argument(
         "--pics-dir",
@@ -498,7 +539,7 @@ def main() -> None:
         type=int,
         default=DEFAULT_CUBE_SUBDIV,
         metavar="N",
-        help=f"每 1 cm 块体素 N³，默认 {DEFAULT_CUBE_SUBDIV}",
+        help=f"每 1 cm 块散射点细分 N³（默认 {DEFAULT_CUBE_SUBDIV}=单点）",
     )
     parser.add_argument(
         "--skip-existing",
@@ -534,7 +575,7 @@ def main() -> None:
 
     names = args.pattern if args.pattern else pixel_pattern_names(pics_dir)
     if not names:
-        raise SystemExit("未找到图案，请先运行 test_code/generate_pattern_pics.py")
+        raise SystemExit("未找到图案 circle，请先运行 test_code/generate_pattern_pics.py")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"simulate {len(names)} patterns → {output_dir.resolve()}")

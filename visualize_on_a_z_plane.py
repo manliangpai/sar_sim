@@ -3,12 +3,12 @@
 运行示例（在 sar_sim 仓库根目录执行）::
 
   python visualize_on_a_z_plane.py
-  python visualize_on_a_z_plane.py --npz output/raw_radar_data_z0.6/0.npz
-  python visualize_on_a_z_plane.py --npz output/raw_radar_data_z0.6/A.npz --z 0.6
+  python visualize_on_a_z_plane.py --npz output/raw_radar_data_z0.5/circle.npz
+  python visualize_on_a_z_plane.py --npz output/raw_radar_data_z0.5/circle.npz --z 0.5
 
 SAR 立方体可视化：距离 FFT + 固定 z 平面双基地后向投影。
 
-默认读取 output/raw_radar_data_z0.6/0.npz，在 z=0.6 m、±10 cm 网格上成像。
+默认 npz 见 DEFAULT_NPZ；成像 z / x/y 范围 / 格距见下方「成像网格」常量（本脚本专用，不读 config/scene）。
 阵列与转台参数来自 sar_sim.config（2TX×4RX）。
 """
 
@@ -31,27 +31,24 @@ import numpy as np
 from sar_sim.config import (
     ArrayConfig,
     C_LIGHT,
-    PIXEL_CELL_M,
-    PIXEL_GRID_N,
-    PIXEL_PLANE_SIZE_M,
-    PIXEL_PLANE_Z_M,
     RadarConfig,
     SarRotationConfig,
     channel_tx_rx_index,
     rx_positions_at_stop,
     tx_positions_at_stop,
 )
-from sar_sim.simulate_pics import RAW_RADAR_DIR, load_sar_cube
+from sar_sim.simulate_pics import load_sar_cube
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
-DEFAULT_NPZ = RAW_RADAR_DIR / "0.npz"
+DEFAULT_NPZ = _PACKAGE_ROOT / "output" / "raw_radar_data_z0.5" / "circle.npz"
 
-# pixel_pattern 默认：z=0.6 m，20×20 @ 1 cm（±10 cm）
-Z_PLANE_M = PIXEL_PLANE_Z_M
-XY_HALF_M = PIXEL_PLANE_SIZE_M * 0.5
-XY_MIN_M = -XY_HALF_M
-XY_MAX_M = XY_HALF_M
-XY_STEP_M = PIXEL_CELL_M
+# ---------------------------------------------------------------------------
+# 成像网格（本脚本专用，不依赖 config/scene）
+# ---------------------------------------------------------------------------
+IMAGING_Z_M = 0.5
+XY_MIN_M = -0.2
+XY_MAX_M = 0.2
+CELL_STEP_M = 0.005
 
 _CJK_FONT_CANDIDATES = (
     "Microsoft YaHei",
@@ -90,22 +87,18 @@ def range_bins_to_slant_range_m(
     return f_beat_hz * C_LIGHT / (2.0 * radar.slope_hz_per_s)
 
 
-def imaging_grid_axes(
-    xy_min: float = XY_MIN_M,
-    xy_max: float = XY_MAX_M,
-    step: float = XY_STEP_M,
-    n: int | None = PIXEL_GRID_N,
-) -> tuple[np.ndarray, np.ndarray]:
-    """格心坐标轴；默认 20×20 pixel_pattern 网格。"""
-    if n is not None:
-        half = n * step * 0.5
-        axis = (-half + (np.arange(n, dtype=np.float64) + 0.5) * step).astype(
-            np.float64
-        )
-        return axis, axis.copy()
-    x_axis = np.arange(xy_min, xy_max + 0.5 * step, step, dtype=np.float64)
-    y_axis = np.arange(xy_min, xy_max + 0.5 * step, step, dtype=np.float64)
-    return x_axis, y_axis
+def imaging_grid_axes() -> tuple[np.ndarray, np.ndarray]:
+    """
+    成像格心坐标轴 (m)。
+
+    由 XY_MIN_M、XY_MAX_M、CELL_STEP_M 确定范围与格距；
+    格点数 n = (XY_MAX - XY_MIN) / CELL_STEP。
+    """
+    n = int(round((XY_MAX_M - XY_MIN_M) / CELL_STEP_M))
+    axis = (XY_MIN_M + (np.arange(n, dtype=np.float64) + 0.5) * CELL_STEP_M).astype(
+        np.float64
+    )
+    return axis, axis.copy()
 
 
 def channel_tx_rx_positions_all_stops(
@@ -165,7 +158,7 @@ def _interp_range_cube(
 
 def backproject_z_plane(
     range_cube: np.ndarray,
-    z_m: float = Z_PLANE_M,
+    z_m: float = IMAGING_Z_M,
     x_axis: np.ndarray | None = None,
     y_axis: np.ndarray | None = None,
     radar: RadarConfig | None = None,
@@ -228,7 +221,7 @@ def plot_z_plane(
     image: np.ndarray,
     x_axis: np.ndarray,
     y_axis: np.ndarray,
-    z_m: float = Z_PLANE_M,
+    z_m: float = IMAGING_Z_M,
     *,
     display_floor_ratio: float = 0.0,
     interpolation: str = "nearest",
@@ -237,7 +230,7 @@ def plot_z_plane(
     z=const 平面强度图。
 
     display_floor_ratio : 0 = 线性色标 [0, 峰值]；>0 仅用于压低旁瓣显示。
-    interpolation='nearest' : 不做像素插值，避免 10 cm 网格被抹成菱形斑块。
+    interpolation='nearest' : 不做像素插值，避免格点被插值抹糊。
     """
     mag = np.abs(image)
     peak = float(mag.max()) if mag.size else 1.0
@@ -264,10 +257,8 @@ def plot_z_plane(
 
 def run_z_plane_view(
     npz_path: Path = DEFAULT_NPZ,
-    z_m: float = Z_PLANE_M,
-    xy_min: float = XY_MIN_M,
-    xy_max: float = XY_MAX_M,
-    xy_step: float = XY_STEP_M,
+    z_m: float = IMAGING_Z_M,
+    *,
     display_floor_ratio: float = 0.0,
     show: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -286,10 +277,11 @@ def run_z_plane_view(
     print("range FFT ...")
     range_cube = range_fft_cube(raw)
 
-    x_axis, y_axis = imaging_grid_axes(xy_min, xy_max, xy_step)
+    x_axis, y_axis = imaging_grid_axes()
+    n = len(x_axis)
     print(
-        f"backproject z = {z_m} m, grid {len(x_axis)} x {len(y_axis)} "
-        f"(step {xy_step*100:.0f} cm), "
+        f"backproject z = {z_m} m, x/y [{XY_MIN_M}, {XY_MAX_M}] m, "
+        f"step {CELL_STEP_M} m → {n}×{n}, "
         f"{rotation.n_stops} stops x {array.n_channels} ch ..."
     )
     t0 = time.perf_counter()
@@ -325,9 +317,9 @@ def main() -> None:
     parser.add_argument(
         "--z",
         type=float,
-        default=Z_PLANE_M,
+        default=IMAGING_Z_M,
         metavar="M",
-        help=f"成像 z 平面 (m)，默认 {Z_PLANE_M}",
+        help=f"成像 z 平面 (m)，默认 {IMAGING_Z_M}",
     )
     args = parser.parse_args()
     run_z_plane_view(npz_path=args.npz, z_m=args.z)

@@ -1,4 +1,4 @@
-"""轻量 UNet：20×20 BP magnitude → 20×20 二值 logits。"""
+"""轻量 UNet：N×N BP magnitude → N×N 二值 logits。"""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class _ConvBlock(nn.Module):
 
 
 class UNetSmall(nn.Module):
-    """2 次下采样，适合 20×20 输入。"""
+    """2 次下采样，适合 28×28 等 4 的倍数输入。"""
 
     def __init__(self, in_channels: int = 1, base_channels: int = 32) -> None:
         super().__init__()

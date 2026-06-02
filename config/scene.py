@@ -1,7 +1,7 @@
 """
-pixel_pattern 场景：20×20、1 cm 格距金属立方体体素化散射体。
+pixel_pattern 场景：28×28、1 cm 格距（28 cm×28 cm 平面），每格一个点散射体。
 
-GT 数组位于 output/pics/{NAME}.npy（数字/字母、Fashion-MNIST 等训练图案）。
+GT 数组位于 output/pics/circle.npy（上下左右对称的圆环图案）。
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import numpy as np
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PATTERN_PICS_DIR = _PACKAGE_ROOT / "output" / "pics"
+DEFAULT_PATTERN_NAME = "circle"
 
 
 @dataclass(frozen=True)
@@ -32,46 +33,41 @@ def targets_to_xyz(targets: List[PointTarget]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Z=0.6 m 平面 20×20 像素图案（1 cm³ 金属立方体体素化）
+# Z=0.5 m 平面 28×28 像素图案（28 cm×28 cm，1 cm 不锈钢块 → 每格 1 点）
+# x/y ∈ [-0.14, +0.14] m
 # ---------------------------------------------------------------------------
 
-PIXEL_GRID_N = 20
+PIXEL_GRID_N = 28
 PIXEL_CELL_M = 0.01
-PIXEL_PLANE_Z_M = 0.6
-PIXEL_PLANE_SIZE_M = PIXEL_GRID_N * PIXEL_CELL_M
-DEFAULT_CUBE_SUBDIV = 3
+PIXEL_PLANE_Z_M = 0.5
+PIXEL_PLANE_SIZE_M = PIXEL_GRID_N * PIXEL_CELL_M  # 0.28 m
 
 
-def _pattern_sort_key(name: str) -> tuple[str, int] | tuple[str]:
-    """
-    图案名排序：``{前缀}_{编号}`` 按编号自然数序（1,2,…,10 而非 1,10,2）；
-    纯数字名（0-9）按数值；其余按名称。
-    """
-    if "_" in name:
-        prefix, _, suffix = name.rpartition("_")
-        if suffix.isdigit():
-            return (prefix, int(suffix))
-    if name.isdigit():
-        return ("", int(name))
-    return (name,)
+def radar_data_z_dir(prefix: str) -> Path:
+    """按成像 z 生成 output 子目录名，如 raw_radar_data_z0.5。"""
+    return _PACKAGE_ROOT / "output" / f"{prefix}_z{PIXEL_PLANE_Z_M:g}"
+
+
+DEFAULT_CUBE_SUBDIV = 1
+
+
+
+def default_pattern_names() -> List[str]:
+    """当前项目默认图案列表（圆环）。"""
+    return [DEFAULT_PATTERN_NAME]
 
 
 def pixel_pattern_names(pics_dir: Path | None = None) -> List[str]:
-    """pics 目录下可用图案名（*.npy）。"""
-    root = pics_dir or DEFAULT_PATTERN_PICS_DIR
-    if not root.is_dir():
-        return []
-    return sorted(
-        (p.stem for p in root.glob("*.npy")),
-        key=_pattern_sort_key,
-    )
+    """可用图案名；当前固定为 ``circle``。"""
+    _ = pics_dir
+    return default_pattern_names()
 
 
 def load_pixel_pattern_gt(path: Path | str) -> np.ndarray:
     """
     读取 GT 数组。
 
-    返回 (20, 20) uint8，1=有 1 cm³ 金属块，0=空。
+    返回 (28, 28) uint8，1=有 1 cm 金属块，0=空。
     行 0 为显示最上行，与 generate_pattern_pics 一致。
     """
     path = Path(path)
@@ -97,18 +93,28 @@ def resolve_pixel_pattern_gt(
     raise FileNotFoundError(f"未找到 GT {pattern_name}{hint}")
 
 
-def _pixel_cell_origin_m(col: int, display_row: int) -> Tuple[float, float, float]:
-    """格点左下前角 (x0,y0,z0)；立方体 x/y 居中于原点，z 以 PIXEL_PLANE_Z_M 为中心。"""
+def _pixel_cell_center_m(col: int, display_row: int) -> Tuple[float, float, float]:
+    """格心 (x, y, z)；1 cm 块以 PIXEL_PLANE_Z_M 为中心。"""
     if not (0 <= col < PIXEL_GRID_N and 0 <= display_row < PIXEL_GRID_N):
         raise ValueError(
             f"格点索引须在 [0, {PIXEL_GRID_N}) 内，得到 ({col}, {display_row})"
         )
     math_row = PIXEL_GRID_N - 1 - display_row
     half = PIXEL_PLANE_SIZE_M * 0.5
-    x0 = -half + col * PIXEL_CELL_M
-    y0 = -half + math_row * PIXEL_CELL_M
-    z0 = PIXEL_PLANE_Z_M - PIXEL_CELL_M * 0.5
-    return x0, y0, z0
+    x = -half + (col + 0.5) * PIXEL_CELL_M
+    y = -half + (math_row + 0.5) * PIXEL_CELL_M
+    z = PIXEL_PLANE_Z_M
+    return x, y, z
+
+
+def _pixel_cell_origin_m(col: int, display_row: int) -> Tuple[float, float, float]:
+    """格点左下前角 (x0,y0,z0)；供体素 subdiv>1 时使用。"""
+    x, y, z = _pixel_cell_center_m(col, display_row)
+    return (
+        x - PIXEL_CELL_M * 0.5,
+        y - PIXEL_CELL_M * 0.5,
+        z - PIXEL_CELL_M * 0.5,
+    )
 
 
 def _sample_metal_cube(
@@ -147,7 +153,7 @@ def targets_from_pixel_mask(
     cube_subdiv: int = DEFAULT_CUBE_SUBDIV,
     block_amplitude: float = 1.0,
 ) -> List[PointTarget]:
-    """(20, 20) GT 掩膜 → 体素化金属立方体散射体列表。"""
+    """GT 掩膜 → 点散射体列表（每格 1 点或 subdiv³ 点）。"""
     if isinstance(mask, (str, Path)):
         gt = load_pixel_pattern_gt(mask)
     else:
@@ -165,23 +171,29 @@ def targets_from_pixel_mask(
             if not gt[display_row, col]:
                 continue
             n_blocks += 1
-            x0, y0, z0 = _pixel_cell_origin_m(col, display_row)
-            targets.extend(
-                _sample_metal_cube(
-                    x0,
-                    y0,
-                    z0,
-                    cube_subdiv=cube_subdiv,
-                    block_amplitude=block_amplitude,
+            if cube_subdiv <= 1:
+                x, y, z = _pixel_cell_center_m(col, display_row)
+                targets.append(
+                    PointTarget(x=x, y=y, z=z, amplitude=block_amplitude)
                 )
-            )
+            else:
+                x0, y0, z0 = _pixel_cell_origin_m(col, display_row)
+                targets.extend(
+                    _sample_metal_cube(
+                        x0,
+                        y0,
+                        z0,
+                        cube_subdiv=cube_subdiv,
+                        block_amplitude=block_amplitude,
+                    )
+                )
     if n_blocks == 0:
         raise ValueError("GT 中没有任何金属格点（值为 1）")
     return targets
 
 
 def pixel_pattern_scene(
-    pattern_name: str = "0",
+    pattern_name: str = "circle",
     *,
     pics_dir: Path | None = None,
     cube_subdiv: int = DEFAULT_CUBE_SUBDIV,
@@ -190,8 +202,8 @@ def pixel_pattern_scene(
     """
     从 output/pics/{pattern_name}.npy 构建场景。
 
-    每个 1 cm 金属格点划分为 cube_subdiv×cube_subdiv×cube_subdiv 散射点
-    （默认 3³=27 点/块）；块内各点幅度 = block_amplitude / 27。
+    每个 1 cm 金属格点默认用 1 个点散射体表示（cube_subdiv=1）；
+    subdiv>1 时划分为 cube_subdiv³ 个点，块内幅度均分。
     """
     path = resolve_pixel_pattern_gt(pattern_name, pics_dir=pics_dir)
     mask = load_pixel_pattern_gt(path)
@@ -211,7 +223,7 @@ def describe_pixel_pattern(
         f"pixel_pattern '{pattern_name}' @ z={PIXEL_PLANE_Z_M} m",
         (
             f"  grid: {PIXEL_GRID_N}×{PIXEL_GRID_N} @ {PIXEL_CELL_M*1e2:.0f} cm, "
-            f"voxelized 1 cm³ cubes"
+            f"one point scatterer per metal block"
         ),
         f"  scatterers: {len(targets)}",
         (
