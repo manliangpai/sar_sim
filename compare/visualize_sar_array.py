@@ -34,7 +34,7 @@ from sar_sim.config.array import (
     tx_positions_at_stop,
 )
 from sar_sim.config.radar_config import AntennaPattern
-from sar_sim.config.scene import PIXEL_PLANE_Z_M
+from sar_sim.config.scene import PLATE_Z_MAX_M
 
 DEFAULT_FOV_STOPS = (1, 151)
 _PLANE_Z = 0.5
@@ -396,7 +396,7 @@ def main() -> None:
     parser.add_argument("--stops", type=int, default=None)
     parser.add_argument("--step-deg", type=float, default=None)
     parser.add_argument("--start-angle-deg", type=float, default=0.0)
-    parser.add_argument("--fov-range", type=float, default=PIXEL_PLANE_Z_M)
+    parser.add_argument("--fov-range", type=float, default=PLATE_Z_MAX_M)
     parser.add_argument(
         "--fov-stops",
         type=int,

@@ -6,9 +6,8 @@
 
 运行（在 sar_sim 仓库根目录）::
 
-  python compare/simulate_compare.py          # 3D 场景 + BP 成像（两个窗口）
-  python compare/simulate_compare.py --gpu
-  python compare/simulate_compare.py --no-plot   # 仅终端输出
+  python compare/simulate_compare.py              # 3D 场景 + BP 成像（两个窗口）
+  python compare/simulate_compare.py --no-plot    # 仅终端输出
 """
 
 from __future__ import annotations
@@ -26,10 +25,11 @@ if __name__ == "__main__" and __package__ is None:
 
 import numpy as np
 
-from sar_sim.config import ArrayConfig, PointTarget, RadarConfig, SarRotationConfig
+from sar_sim.config import ArrayConfig, RadarConfig, SarRotationConfig, ScatterMesh
 from sar_sim.config import C_LIGHT
 from sar_sim.config.radar_config import AntennaPattern
-from sar_sim.simulate_pics import simulate_sar_rotation_cube
+from sar_sim.config.scene import scatter_mesh_from_points
+from sar_sim.simulate_pics import simulate_mesh_rotation_cube
 
 _DEFAULT_FOV_STOPS = (1, 151)
 
@@ -76,22 +76,19 @@ def bp_grid_axes() -> tuple[np.ndarray, np.ndarray]:
     return axis, axis.copy()
 
 
-def targets_from_plane_points(
+def mesh_from_plane_points(
     p1: np.ndarray,
     p2: np.ndarray,
     *,
     amplitude: float = 1.0,
-) -> list[PointTarget]:
-    return [
-        PointTarget(x=float(p1[0]), y=float(p1[1]), z=float(p1[2]), amplitude=amplitude),
-        PointTarget(x=float(p2[0]), y=float(p2[1]), z=float(p2[2]), amplitude=amplitude),
-    ]
+) -> ScatterMesh:
+    positions = np.array([p1, p2], dtype=np.float64)
+    return scatter_mesh_from_points(positions, amplitudes=np.array([amplitude, amplitude]))
 
 
 def simulate_raw_cube(
-    targets: list[PointTarget],
+    mesh: ScatterMesh,
     *,
-    use_gpu: bool,
     start_angle_rad: float = 0.0,
 ) -> np.ndarray:
     """(n_stops, 8, n_adc) complex64，默认 600×8×256。"""
@@ -103,14 +100,13 @@ def simulate_raw_cube(
         if k == 1 or k == n or k % 100 == 0:
             print(f"  simulate stop {k}/{n}", flush=True)
 
-    cube = simulate_sar_rotation_cube(
+    cube = simulate_mesh_rotation_cube(
+        mesh,
         radar=radar,
         array=array,
         rotation=rotation,
-        targets=targets,
         c=C_LIGHT,
         progress_callback=progress,
-        use_gpu=use_gpu,
     )
     expected = (rotation.n_stops, array.n_channels, radar.n_adc_samples)
     if cube.shape != expected:
@@ -180,7 +176,6 @@ def _top_peaks(mag: np.ndarray, x_axis: np.ndarray, y_axis: np.ndarray, n: int =
 def main() -> None:
     parser = argparse.ArgumentParser(description="双点 5° 场景：仿真 + z=0.5 BP（无文件输出）")
     parser.add_argument("--seed", type=int, default=None, help="随机点对种子")
-    parser.add_argument("--gpu", action="store_true", help="仿真使用 GPU（BP 始终用 GPU）")
     parser.add_argument(
         "--no-plot",
         action="store_true",
@@ -201,7 +196,7 @@ def main() -> None:
         rng=rng,
     )
     ang = angle_between(p1, p2)
-    targets = targets_from_plane_points(p1, p2, amplitude=args.amplitude)
+    mesh = mesh_from_plane_points(p1, p2, amplitude=args.amplitude)
 
     print("场景：两点散射体（平面 z=0.5 m，|x|,|y|≤0.2 m，∠AOB=5°）")
     print(f"  A = ({p1[0]:.4f}, {p1[1]:.4f}, {p1[2]:.4f})")
@@ -210,7 +205,7 @@ def main() -> None:
 
     t0 = time.perf_counter()
     print("1) SAR 仿真 …")
-    raw = simulate_raw_cube(targets, use_gpu=args.gpu)
+    raw = simulate_raw_cube(mesh)
     print(f"   raw shape {raw.shape}  dtype {raw.dtype}  (不保存文件)")
 
     print("2) 距离 FFT + z=0.5 m BP …")

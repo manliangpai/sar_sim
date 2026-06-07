@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-运行示例（在 sar_sim 仓库根目录执行）::
+SAR raw 立方体 → 距离 FFT → 固定 z 平面双基地后向投影并显示。
+
+运行（在 sar_sim 仓库根目录）::
 
   python visualize_on_a_z_plane.py
-  python visualize_on_a_z_plane.py --npz output/raw_radar_data_z0.5/circle.npz
-  python visualize_on_a_z_plane.py --npz output/raw_radar_data_z0.5/circle.npz --z 0.5
 
-SAR 立方体可视化：距离 FFT + 固定 z 平面双基地后向投影。
-
-默认 npz 见 DEFAULT_NPZ；成像 z / x/y 范围 / 格距见下方「成像网格」常量（本脚本专用，不读 config/scene）。
-阵列与转台参数来自 sar_sim.config（2TX×4RX）。
+参数：
+  --npz PATH  raw SAR npz（默认 output/raw_radar_data/metal_plate_20x20x5cm.npz）
+  --z M       成像 z 平面 (m)，默认 0.45（成像网格见本文件常量）
 """
 
 from __future__ import annotations
@@ -37,15 +36,16 @@ from sar_sim.config import (
     rx_positions_at_stop,
     tx_positions_at_stop,
 )
+from sar_sim.config.scene import DEFAULT_PLY_PATH, radar_output_dir, raw_npz_stem
 from sar_sim.simulate_pics import load_sar_cube
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
-DEFAULT_NPZ = _PACKAGE_ROOT / "output" / "raw_radar_data_z0.5" / "circle.npz"
+DEFAULT_NPZ = radar_output_dir("raw_radar_data") / f"{raw_npz_stem(DEFAULT_PLY_PATH)}.npz"
 
 # ---------------------------------------------------------------------------
 # 成像网格（本脚本专用，不依赖 config/scene）
 # ---------------------------------------------------------------------------
-IMAGING_Z_M = 0.5
+IMAGING_Z_M = 0.45
 XY_MIN_M = -0.2
 XY_MAX_M = 0.2
 CELL_STEP_M = 0.005

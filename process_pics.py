@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-批量处理 pixel_pattern 场景：GPU 距离 FFT + z 平面双基地后向投影。
+金属板场景：GPU 距离 FFT + z 平面双基地后向投影。
 
-读取 output/raw_radar_data_z0.5/{NAME}.npz，在固定 BP 网格上成像，
+读取 output/raw_radar_data/{PLY名}.npz，在固定 BP 网格上成像，
 保存 (100, 100, 2) float32：通道 0=实部，通道 1=虚部。
 
-BP 网格（本脚本专用，与 config/scene 的 GT 28×28 无关）：
+BP 网格（本脚本专用）：
   z = 0.5 m，x/y ∈ [-0.2, +0.2] m，步长 0.004 m → 100×100。
 
 运行（在 sar_sim 仓库根目录）::
 
   python process_pics.py
-  python process_pics.py --pattern circle
+  python process_pics.py --raw output/raw_radar_data/metal_plate_20x20x5cm.npz
 """
 
 from __future__ import annotations
@@ -37,13 +37,13 @@ from sar_sim.config import (
     rx_positions_at_stop,
     tx_positions_at_stop,
 )
-from sar_sim.config.scene import pixel_pattern_names, radar_data_z_dir
+from sar_sim.config.scene import DEFAULT_PLY_PATH, raw_npz_stem, radar_output_dir
 from sar_sim.simulate_pics import load_sar_cube
 from sar_sim.visualize_on_a_z_plane import range_bins_to_slant_range_m
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
-DEFAULT_INPUT_DIR = radar_data_z_dir("raw_radar_data")
-DEFAULT_OUTPUT_DIR = radar_data_z_dir("processed_radar_data")
+DEFAULT_INPUT_DIR = radar_output_dir("raw_radar_data")
+DEFAULT_OUTPUT_DIR = radar_output_dir("processed_radar_data")
 
 # ---------------------------------------------------------------------------
 # BP 成像网格（本脚本专用）
@@ -188,23 +188,18 @@ def _backproject_z_plane_gpu(
     return image.cpu().numpy().astype(np.complex64)
 
 
-def raw_npz_path(pattern_name: str, input_dir: Path) -> Path:
-    return input_dir / f"{pattern_name}.npz"
-
-
-def process_one_pattern(
-    pattern_name: str,
+def process_raw(
+    raw_path: Path,
     *,
-    input_dir: Path,
     output_dir: Path,
     z_m: float = BP_Z_M,
 ) -> tuple[np.ndarray, Path]:
     """读取 raw → GPU 距离 FFT → GPU z 平面 BP → (100,100,2)。"""
-    in_path = raw_npz_path(pattern_name, input_dir)
+    in_path = raw_path
     if not in_path.is_file():
         raise FileNotFoundError(
             f"缺少 raw 数据：{in_path}\n"
-            f"请先运行：python simulate_pics.py --pattern {pattern_name}"
+            f"请先运行：python simulate_pics.py"
         )
 
     raw, start_angle_rad = load_sar_cube(in_path)
@@ -229,64 +224,21 @@ def process_one_pattern(
     )
 
     data = complex_image_to_bp_data(image)
-    out_path = output_dir / f"{pattern_name}.npz"
+    out_path = output_dir / f"{in_path.stem}.npz"
     np.savez_compressed(out_path, data=data)
     return data, out_path
 
 
-def process_all(
-    pattern_names: list[str],
-    *,
-    input_dir: Path,
-    output_dir: Path,
-    z_m: float = BP_Z_M,
-) -> dict[str, dict[str, object]]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    results: dict[str, dict[str, object]] = {}
-
-    for name in pattern_names:
-        t0 = time.perf_counter()
-        print(f"processing {name} ...", flush=True)
-        data, out_path = process_one_pattern(
-            name,
-            input_dir=input_dir,
-            output_dir=output_dir,
-            z_m=z_m,
-        )
-        elapsed = time.perf_counter() - t0
-        mag = np.hypot(data[..., 0], data[..., 1])
-        peak = float(mag.max())
-        entry = {
-            "file": out_path.name,
-            "shape": list(data.shape),
-            "peak_magnitude": peak,
-            "elapsed_s": round(elapsed, 2),
-        }
-        results[name] = entry
-        print(f"  saved {out_path}  peak={peak:.4g}  ({elapsed:.1f}s)", flush=True)
-
-    for path in output_dir.glob("*.json"):
-        path.unlink()
-
-    return results
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="pixel_pattern raw → GPU z 平面 BP (100×100×2 Re/Im)"
+        description="金属板 raw → GPU z 平面 BP (100×100×2 Re/Im)"
     )
+    default_raw = DEFAULT_INPUT_DIR / f"{raw_npz_stem(DEFAULT_PLY_PATH)}.npz"
     parser.add_argument(
-        "--pattern",
-        nargs="*",
-        default=None,
-        metavar="NAME",
-        help="图案名（默认 circle）",
-    )
-    parser.add_argument(
-        "--input-dir",
+        "--raw",
         type=Path,
-        default=DEFAULT_INPUT_DIR,
-        help=f"仿真 raw 目录（默认 {DEFAULT_INPUT_DIR}）",
+        default=default_raw,
+        help=f"仿真 raw npz（默认 {default_raw.name}）",
     )
     parser.add_argument(
         "--output-dir",
@@ -303,12 +255,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    names = args.pattern if args.pattern else pixel_pattern_names()
-    if not names:
-        raise SystemExit("未指定图案；请 --pattern circle 或先配置 scene 默认图案")
-
-    print(f"patterns: {len(names)}")
-    print(f"  input : {args.input_dir.resolve()}")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  raw   : {args.raw.resolve()}")
     print(f"  output: {args.output_dir.resolve()}")
     print(f"  gpu   : {_gpu_device_name()}")
     print(
@@ -316,13 +264,18 @@ def main() -> None:
         f"x/y [{BP_XY_MIN_M}, {BP_XY_MAX_M}] m, step {BP_STEP_M} m, z={args.z} m"
     )
 
-    process_all(
-        names,
-        input_dir=args.input_dir,
+    t0 = time.perf_counter()
+    data, out_path = process_raw(
+        args.raw,
         output_dir=args.output_dir,
         z_m=args.z,
     )
-    print(f"done: {len(names)} files → {args.output_dir.resolve()}")
+    elapsed = time.perf_counter() - t0
+    mag = np.hypot(data[..., 0], data[..., 1])
+    print(
+        f"saved {out_path}  peak={float(mag.max()):.4g}  ({elapsed:.1f}s)",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

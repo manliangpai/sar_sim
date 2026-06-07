@@ -5,7 +5,7 @@
 在 sar_sim 仓库根目录运行::
 
   python compare/analyze_5deg_resolution.py
-  python compare/analyze_5deg_resolution.py --trials 12 --gpu
+  python compare/analyze_5deg_resolution.py --trials 12
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ _load_viz_array = _sc._load_viz_array
 backproject_z_plane = _sc.backproject_z_plane
 bp_grid_axes = _sc.bp_grid_axes
 simulate_raw_cube = _sc.simulate_raw_cube
-targets_from_plane_points = _sc.targets_from_plane_points
+mesh_from_plane_points = _sc.mesh_from_plane_points
 
 
 def world_angle_deg(p1: np.ndarray, p2: np.ndarray) -> float:
@@ -95,7 +95,7 @@ def saddle_ratio(mag: np.ndarray, x_axis: np.ndarray, y_axis: np.ndarray, p1: np
     return float(mid.min()) / peak
 
 
-def run_trial(seed: int, *, use_gpu: bool) -> dict:
+def run_trial(seed: int) -> dict:
     viz = _load_viz_array()
     rng = np.random.default_rng(seed)
     p1, p2 = viz.sample_plane_point_pair(
@@ -111,10 +111,7 @@ def run_trial(seed: int, *, use_gpu: bool) -> dict:
     import io
 
     with contextlib.redirect_stdout(io.StringIO()):
-        raw = simulate_raw_cube(
-            targets_from_plane_points(p1, p2),
-            use_gpu=use_gpu,
-        )
+        raw = simulate_raw_cube(mesh_from_plane_points(p1, p2))
         image = backproject_z_plane(raw)
     mag = np.abs(image)
     x_ax, y_ax = bp_grid_axes()
@@ -165,7 +162,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="5° 双点分辨能力批量仿真")
     parser.add_argument("--trials", type=int, default=8, help="随机种子个数")
     parser.add_argument("--seed-start", type=int, default=0)
-    parser.add_argument("--gpu", action="store_true")
     args = parser.parse_args()
 
     print("=== 600 停 SAR · 5° 世界夹角双点 · 仿真分辨分析 ===")
@@ -179,7 +175,7 @@ def main() -> None:
     for i in range(args.trials):
         seed = args.seed_start + i
         print(f"--- trial seed={seed} ---")
-        r = run_trial(seed, use_gpu=args.gpu)
+        r = run_trial(seed)
         results.append(r)
         print(
             f"  ∠AOB={r['angle_deg']:.3f}°  平面间距={r['xy_sep_cm']:.2f} cm  "

@@ -1,242 +1,271 @@
 """
-pixel_pattern 场景：28×28、1 cm 格距（28 cm×28 cm 平面），每格一个点散射体。
+场景坐标与 PLY mesh 加载。
 
-GT 数组位于 output/pics/circle.npy（上下左右对称的圆环图案）。
+世界坐标系（传送带扫描工位）：
+  Z = 0    雷达阵列所在平面（阵列绕 +Z 转台旋转，停点 1 时 PCB 在 y=z=0）
+  Z = 0.5  传送带顶面；阵列到传送带垂直距离 0.5 m
+  被扫物体放在传送带上，例如金属板顶面 z=0.5 m、厚度 5 cm 则 z∈[0.45, 0.5]
+
+默认模型 data/metal_plate_20x20x5cm.ply（20 cm × 20 cm × 5 cm 长方体）。
 """
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import List, Sequence, Tuple, Union
-
 import numpy as np
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PATTERN_PICS_DIR = _PACKAGE_ROOT / "output" / "pics"
-DEFAULT_PATTERN_NAME = "circle"
+DEFAULT_PLY_PATH = _PACKAGE_ROOT / "data" / "metal_plate_20x20x5cm.ply"
+
+
+def raw_npz_stem(ply_path: Path | str | None = None) -> str:
+    """仿真 raw npz 基名：与 PLY 文件名一致（不含扩展名）。"""
+    return Path(ply_path or DEFAULT_PLY_PATH).stem
+
+RADAR_PLANE_Z_M = 0.0
+CONVEYOR_Z_M = 0.5
+
+PLATE_X_HALF_M = 0.1
+PLATE_Y_HALF_M = 0.1
+PLATE_Z_MIN_M = 0.45
+PLATE_Z_MAX_M = CONVEYOR_Z_M
+PLATE_Z_CENTER_M = 0.5 * (PLATE_Z_MIN_M + PLATE_Z_MAX_M)
+
+
+def radar_output_dir(prefix: str) -> Path:
+    return _PACKAGE_ROOT / "output" / prefix
+
+
+class ScatterMode(str, Enum):
+    VERTEX = "vertex"
+    FACE_CENTER = "face_center"
+    FACE_VISIBLE = "face_visible"
 
 
 @dataclass(frozen=True)
-class PointTarget:
-    """点散射体。"""
+class ReflectionConfig:
+    enabled: bool = False
+    points: tuple[tuple[float, float, float], ...] = ()
+    coefficients: tuple[float, ...] = ()
 
-    x: float
-    y: float
-    z: float
-    amplitude: float = 1.0
-
-
-def targets_to_xyz(targets: List[PointTarget]) -> np.ndarray:
-    """(N, 3) 目标坐标。"""
-    return np.array([[t.x, t.y, t.z] for t in targets], dtype=np.float64)
-
-
-# ---------------------------------------------------------------------------
-# Z=0.5 m 平面 28×28 像素图案（28 cm×28 cm，1 cm 不锈钢块 → 每格 1 点）
-# x/y ∈ [-0.14, +0.14] m
-# ---------------------------------------------------------------------------
-
-PIXEL_GRID_N = 28
-PIXEL_CELL_M = 0.01
-PIXEL_PLANE_Z_M = 0.5
-PIXEL_PLANE_SIZE_M = PIXEL_GRID_N * PIXEL_CELL_M  # 0.28 m
+    @classmethod
+    def conveyor_belt_grid(
+        cls,
+        *,
+        z: float = CONVEYOR_Z_M,
+        x_range: tuple[float, float] = (-0.15, 0.15),
+        y_range: tuple[float, float] = (-0.15, 0.15),
+        n: int = 3,
+        coefficient: float = 0.35,
+    ) -> "ReflectionConfig":
+        """传送带平面上的反射采样点（TX→物体→传送带→RX 多径）。"""
+        xs = np.linspace(x_range[0], x_range[1], n)
+        ys = np.linspace(y_range[0], y_range[1], n)
+        pts = [(float(x), float(y), float(z)) for x in xs for y in ys]
+        return cls(enabled=True, points=tuple(pts), coefficients=tuple([coefficient] * len(pts)))
 
 
-def radar_data_z_dir(prefix: str) -> Path:
-    """按成像 z 生成 output 子目录名，如 raw_radar_data_z0.5。"""
-    return _PACKAGE_ROOT / "output" / f"{prefix}_z{PIXEL_PLANE_Z_M:g}"
+@dataclass(frozen=True)
+class ScatterMesh:
+    positions: np.ndarray
+    area_weight: np.ndarray
+    normals: np.ndarray | None
+    mode: ScatterMode
+    ply_path: str = ""
+
+    @property
+    def n_scatterers(self) -> int:
+        return int(self.positions.shape[0])
 
 
-DEFAULT_CUBE_SUBDIV = 1
+def _parse_ply_header(data: bytes) -> tuple[bool, int, int, int]:
+    text = data[: min(len(data), 65536)].split(b"\n")
+    is_binary = False
+    n_vert = n_face = 0
+    header_end = 0
+    for i, raw in enumerate(text):
+        line = raw.decode("ascii", errors="ignore").strip()
+        if line == "end_header":
+            header_end = sum(len(text[j]) + 1 for j in range(i + 1))
+            break
+        if line.startswith("format binary"):
+            is_binary = True
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "element" and parts[1] == "vertex":
+            n_vert = int(parts[2])
+        if len(parts) >= 3 and parts[0] == "element" and parts[1] == "face":
+            n_face = int(parts[2])
+    if header_end == 0 or n_vert <= 0:
+        raise ValueError("PLY 头解析失败")
+    return is_binary, header_end, n_vert, n_face
 
 
+def _load_ply_binary(data: bytes, header_end: int, n_vert: int, n_face: int) -> tuple[np.ndarray, np.ndarray]:
+    off = header_end
+    vertices = np.frombuffer(data, dtype="<f4", count=n_vert * 3, offset=off).reshape(n_vert, 3).astype(
+        np.float64
+    )
+    off += n_vert * 12
+    faces = np.zeros((n_face, 3), dtype=np.int32)
+    for fi in range(n_face):
+        n = data[off]
+        if n != 3:
+            raise ValueError(f"仅支持三角面，面 {fi} 有 {n} 顶点")
+        i0, i1, i2 = struct.unpack_from("<iii", data, off + 1)
+        faces[fi] = (i0, i1, i2)
+        off += 13
+    return vertices, faces
 
-def default_pattern_names() -> List[str]:
-    """当前项目默认图案列表（圆环）。"""
-    return [DEFAULT_PATTERN_NAME]
+
+def _load_ply_ascii_text(text: str) -> tuple[np.ndarray, np.ndarray]:
+    lines = text.splitlines()
+    is_bin, _, n_vert, n_face = _parse_ply_header(text.encode("utf-8"))
+    if is_bin:
+        raise ValueError("请用 load_ply() 读取 binary PLY")
+    header_end = 0
+    for i, line in enumerate(lines):
+        if line.strip() == "end_header":
+            header_end = i + 1
+            break
+    vert_lines = lines[header_end : header_end + n_vert]
+    vertices = np.array([[float(x) for x in ln.split()] for ln in vert_lines], dtype=np.float64)
+    faces: list[list[int]] = []
+    for line in lines[header_end + n_vert : header_end + n_vert + n_face]:
+        parts = line.split()
+        if int(parts[0]) != 3:
+            raise ValueError(f"仅支持三角面: {line}")
+        faces.append([int(parts[1]), int(parts[2]), int(parts[3])])
+    return vertices, np.asarray(faces, dtype=np.int32)
 
 
-def pixel_pattern_names(pics_dir: Path | None = None) -> List[str]:
-    """可用图案名；当前固定为 ``circle``。"""
-    _ = pics_dir
-    return default_pattern_names()
-
-
-def load_pixel_pattern_gt(path: Path | str) -> np.ndarray:
-    """
-    读取 GT 数组。
-
-    返回 (28, 28) uint8，1=有 1 cm 金属块，0=空。
-    行 0 为显示最上行，与 generate_pattern_pics 一致。
-    """
+def load_ply(path: Path | str) -> tuple[np.ndarray, np.ndarray]:
+    """读取 ASCII 或 binary PLY。"""
     path = Path(path)
-    arr = np.asarray(np.load(path))
-    if arr.shape != (PIXEL_GRID_N, PIXEL_GRID_N):
-        raise ValueError(f"{path}: 形状须 ({PIXEL_GRID_N},{PIXEL_GRID_N})，得到 {arr.shape}")
-    if not np.all(np.isin(arr, (0, 1))):
-        raise ValueError(f"{path}: GT 须仅含 0/1")
-    return arr.astype(np.uint8, copy=False)
+    data = path.read_bytes()
+    if not data.startswith(b"ply"):
+        raise ValueError(f"不是 PLY: {path}")
+    is_binary, header_end, n_vert, n_face = _parse_ply_header(data)
+    if is_binary:
+        return _load_ply_binary(data, header_end, n_vert, n_face)
+    return _load_ply_ascii_text(data.decode("utf-8"))
 
 
-def resolve_pixel_pattern_gt(
-    pattern_name: str,
-    pics_dir: Path | None = None,
-) -> Path:
-    """按图案名解析 GT：pics_dir/{name}.npy。"""
-    root = pics_dir or DEFAULT_PATTERN_PICS_DIR
-    path = root / f"{pattern_name}.npy"
-    if path.is_file():
-        return path
-    available = ", ".join(pixel_pattern_names(root)[:8])
-    hint = f" 可用: {available}..." if available else " （pics 目录为空）"
-    raise FileNotFoundError(f"未找到 GT {pattern_name}{hint}")
+def load_ply_ascii(path: Path | str) -> tuple[np.ndarray, np.ndarray]:
+    """兼容旧名；支持 ASCII 与 binary。"""
+    return load_ply(path)
 
 
-def _pixel_cell_center_m(col: int, display_row: int) -> Tuple[float, float, float]:
-    """格心 (x, y, z)；1 cm 块以 PIXEL_PLANE_Z_M 为中心。"""
-    if not (0 <= col < PIXEL_GRID_N and 0 <= display_row < PIXEL_GRID_N):
-        raise ValueError(
-            f"格点索引须在 [0, {PIXEL_GRID_N}) 内，得到 ({col}, {display_row})"
-        )
-    math_row = PIXEL_GRID_N - 1 - display_row
-    half = PIXEL_PLANE_SIZE_M * 0.5
-    x = -half + (col + 0.5) * PIXEL_CELL_M
-    y = -half + (math_row + 0.5) * PIXEL_CELL_M
-    z = PIXEL_PLANE_Z_M
-    return x, y, z
+def _triangle_area(v0: np.ndarray, v1: np.ndarray, v2: np.ndarray) -> float:
+    return float(0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0)))
 
 
-def _pixel_cell_origin_m(col: int, display_row: int) -> Tuple[float, float, float]:
-    """格点左下前角 (x0,y0,z0)；供体素 subdiv>1 时使用。"""
-    x, y, z = _pixel_cell_center_m(col, display_row)
+def _triangle_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    tri = vertices[faces]
+    v1 = tri[:, 1] - tri[:, 0]
+    v2 = tri[:, 2] - tri[:, 0]
+    cross = np.cross(v1, v2)
+    denom = np.maximum(np.linalg.norm(cross, axis=1, keepdims=True), 1e-12)
+    return (cross / denom).astype(np.float64)
+
+
+def _triangle_centers_areas(vertices: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    tri = vertices[faces]
+    centers = tri.mean(axis=1)
+    areas = np.array(
+        [_triangle_area(tri[i, 0], tri[i, 1], tri[i, 2]) for i in range(len(faces))],
+        dtype=np.float64,
+    )
+    return centers, areas
+
+
+def _subdivide_triangles(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    levels: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    centers, areas = _triangle_centers_areas(vertices, faces)
+    normals = _triangle_normals(vertices, faces)
+    if levels == 0:
+        return centers, areas, normals
+
+    new_centers: list[np.ndarray] = []
+    new_areas: list[float] = []
+    new_normals: list[np.ndarray] = []
+    for fi in range(faces.shape[0]):
+        v0, v1, v2 = vertices[faces[fi, 0]], vertices[faces[fi, 1]], vertices[faces[fi, 2]]
+        n0 = normals[fi]
+        stack: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = [(v0, v1, v2)]
+        for _ in range(levels):
+            nxt: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+            for a, b, c in stack:
+                m_ab, m_bc, m_ca = 0.5 * (a + b), 0.5 * (b + c), 0.5 * (c + a)
+                nxt.extend([(a, m_ab, m_ca), (m_ab, b, m_bc), (m_ca, m_bc, c), (m_ab, m_bc, m_ca)])
+            stack = nxt
+        for a, b, c in stack:
+            new_centers.append((a + b + c) / 3.0)
+            new_areas.append(_triangle_area(a, b, c))
+            new_normals.append(n0)
     return (
-        x - PIXEL_CELL_M * 0.5,
-        y - PIXEL_CELL_M * 0.5,
-        z - PIXEL_CELL_M * 0.5,
+        np.asarray(new_centers, dtype=np.float64),
+        np.asarray(new_areas, dtype=np.float64),
+        np.asarray(new_normals, dtype=np.float64),
     )
 
 
-def _sample_metal_cube(
-    x0: float,
-    y0: float,
-    z0: float,
+def build_scatter_mesh(
+    ply_path: Path | str,
     *,
-    cell_m: float = PIXEL_CELL_M,
-    cube_subdiv: int = DEFAULT_CUBE_SUBDIV,
-    block_amplitude: float = 1.0,
-) -> List[PointTarget]:
-    """将 1 个 cell_m³ 金属块采样为 cube_subdiv³ 个点散射体。"""
-    if cube_subdiv < 1:
-        raise ValueError(f"cube_subdiv 须 >= 1，得到 {cube_subdiv}")
-    step = cell_m / cube_subdiv
-    n_pts = cube_subdiv**3
-    point_amp = block_amplitude / n_pts
-    targets: List[PointTarget] = []
-    for ix in range(cube_subdiv):
-        for iy in range(cube_subdiv):
-            for iz in range(cube_subdiv):
-                targets.append(
-                    PointTarget(
-                        x=x0 + (ix + 0.5) * step,
-                        y=y0 + (iy + 0.5) * step,
-                        z=z0 + (iz + 0.5) * step,
-                        amplitude=point_amp,
-                    )
-                )
-    return targets
+    mode: ScatterMode = ScatterMode.FACE_VISIBLE,
+    face_subdiv: int = 1,
+    total_amplitude: float = 1.0,
+) -> ScatterMesh:
+    path = Path(ply_path)
+    vertices, faces = load_ply(path)
 
-
-def targets_from_pixel_mask(
-    mask: Union[np.ndarray, str, Path],
-    *,
-    cube_subdiv: int = DEFAULT_CUBE_SUBDIV,
-    block_amplitude: float = 1.0,
-) -> List[PointTarget]:
-    """GT 掩膜 → 点散射体列表（每格 1 点或 subdiv³ 点）。"""
-    if isinstance(mask, (str, Path)):
-        gt = load_pixel_pattern_gt(mask)
+    if mode == ScatterMode.VERTEX:
+        positions = vertices.copy()
+        areas = np.ones(len(vertices), dtype=np.float64)
+        normals = None
     else:
-        gt = np.asarray(mask)
-    if gt.shape != (PIXEL_GRID_N, PIXEL_GRID_N):
-        raise ValueError(f"掩膜须为 ({PIXEL_GRID_N},{PIXEL_GRID_N})，得到 {gt.shape}")
-    if not np.all(np.isin(gt, (0, 1))):
-        raise ValueError("GT 须仅含 0/1")
-    gt = gt.astype(np.uint8)
+        positions, areas, normals = _subdivide_triangles(vertices, faces, levels=face_subdiv)
 
-    targets: List[PointTarget] = []
-    n_blocks = 0
-    for display_row in range(PIXEL_GRID_N):
-        for col in range(PIXEL_GRID_N):
-            if not gt[display_row, col]:
-                continue
-            n_blocks += 1
-            if cube_subdiv <= 1:
-                x, y, z = _pixel_cell_center_m(col, display_row)
-                targets.append(
-                    PointTarget(x=x, y=y, z=z, amplitude=block_amplitude)
-                )
-            else:
-                x0, y0, z0 = _pixel_cell_origin_m(col, display_row)
-                targets.extend(
-                    _sample_metal_cube(
-                        x0,
-                        y0,
-                        z0,
-                        cube_subdiv=cube_subdiv,
-                        block_amplitude=block_amplitude,
-                    )
-                )
-    if n_blocks == 0:
-        raise ValueError("GT 中没有任何金属格点（值为 1）")
-    return targets
+    area_sum = float(areas.sum())
+    if area_sum <= 0:
+        raise ValueError("散射体面积为 0")
+    area_weight = (total_amplitude * areas / area_sum).astype(np.float64)
 
-
-def pixel_pattern_scene(
-    pattern_name: str = "circle",
-    *,
-    pics_dir: Path | None = None,
-    cube_subdiv: int = DEFAULT_CUBE_SUBDIV,
-    block_amplitude: float = 1.0,
-) -> List[PointTarget]:
-    """
-    从 output/pics/{pattern_name}.npy 构建场景。
-
-    每个 1 cm 金属格点默认用 1 个点散射体表示（cube_subdiv=1）；
-    subdiv>1 时划分为 cube_subdiv³ 个点，块内幅度均分。
-    """
-    path = resolve_pixel_pattern_gt(pattern_name, pics_dir=pics_dir)
-    mask = load_pixel_pattern_gt(path)
-    return targets_from_pixel_mask(
-        mask,
-        cube_subdiv=cube_subdiv,
-        block_amplitude=block_amplitude,
+    return ScatterMesh(
+        positions=positions.astype(np.float64),
+        area_weight=area_weight,
+        normals=normals,
+        mode=mode,
+        ply_path=str(path.resolve()),
     )
 
 
-def describe_pixel_pattern(
-    pattern_name: str,
-    targets: Sequence[PointTarget],
-) -> str:
-    """pixel_pattern 场景一行描述 + 散射体统计。"""
-    lines = [
-        f"pixel_pattern '{pattern_name}' @ z={PIXEL_PLANE_Z_M} m",
-        (
-            f"  grid: {PIXEL_GRID_N}×{PIXEL_GRID_N} @ {PIXEL_CELL_M*1e2:.0f} cm, "
-            f"one point scatterer per metal block"
-        ),
-        f"  scatterers: {len(targets)}",
-        (
-            f"  extent: ±{PIXEL_PLANE_SIZE_M*0.5*1e2:.0f} cm in x/y, "
-            f"z∈[{PIXEL_PLANE_Z_M - PIXEL_CELL_M*0.5:.3f},"
-            f"{PIXEL_PLANE_Z_M + PIXEL_CELL_M*0.5:.3f}] m"
-        ),
-    ]
-    if targets:
-        xyz = np.array([[t.x, t.y, t.z] for t in targets], dtype=np.float64)
-        lines.append(
-            f"  bbox x[{xyz[:, 0].min():.3f},{xyz[:, 0].max():.3f}] "
-            f"y[{xyz[:, 1].min():.3f},{xyz[:, 1].max():.3f}] "
-            f"z[{xyz[:, 2].min():.3f},{xyz[:, 2].max():.3f}]"
-        )
-    return "\n".join(lines)
+def scatter_mesh_from_points(
+    positions: np.ndarray,
+    *,
+    amplitudes: np.ndarray | None = None,
+) -> ScatterMesh:
+    """任意坐标点散射体（compare 双点实验等）。"""
+    pos = np.asarray(positions, dtype=np.float64)
+    if pos.ndim != 2 or pos.shape[1] != 3:
+        raise ValueError(f"positions 须为 (N, 3)，得到 {pos.shape}")
+    if amplitudes is None:
+        amp = np.ones(pos.shape[0], dtype=np.float64)
+    else:
+        amp = np.asarray(amplitudes, dtype=np.float64)
+        if amp.shape != (pos.shape[0],):
+            raise ValueError(f"amplitudes 须为 ({pos.shape[0]},)，得到 {amp.shape}")
+    return ScatterMesh(
+        positions=pos,
+        area_weight=amp,
+        normals=None,
+        mode=ScatterMode.VERTEX,
+        ply_path="",
+    )

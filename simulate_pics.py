@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
 """
-pixel_pattern SAR FMCW 前向仿真与批量采集。
+金属板 PLY 场景 SAR FMCW 前向仿真。
 
-2TX×4RX：每个停点 TX1/TX2 各 1 chirp → (n_stops, 8, n_adc) complex64。
+管线：mesh 散射 → (a,τ) 路径 → FMCW ADC → (n_stops, 8, n_adc)。
 
 运行（在 sar_sim 仓库根目录）::
 
-  python simulate_pics.py --gpu
-  python simulate_pics.py --skip-existing
-  python simulate_pics.py --pattern circle
+  python simulate_pics.py
+
+参数：
+  --ply PATH          PLY 模型路径（默认 data/metal_plate_20x20x5cm.ply）
+  --output-dir DIR    raw npz 输出目录（默认 output/raw_radar_data/）
+  --scatter-mode MODE 散射模式：vertex | face_center | face_visible（默认 face_visible）
+  --reflection        启用传送带平面 (z=0.5 m) 反射多径（默认关闭，仅直达径）
+  --path-cache NPZ    缓存/读取静态 mesh 的 (a,τ)，加速重复仿真
+  --skip-existing     输出 npz 已存在则跳过
+  --start-angle-rad   第 1 停转台转角 (rad)，默认 0
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Optional
 
 if __name__ == "__main__" and __package__ is None:
     _root = Path(__file__).resolve().parent.parent
@@ -31,415 +40,352 @@ import numpy as np
 from sar_sim.config import (
     ArrayConfig,
     C_LIGHT,
-    PointTarget,
     RadarConfig,
     SarRotationConfig,
     adc_time_axis,
     angle_deg_at_stop,
-    monostatic_channel_gain,
-    pixel_pattern_scene,
+    channel_tx_rx_index,
     rx_positions_at_stop,
-    targets_to_xyz,
     tx_positions_at_stop,
 )
 from sar_sim.config.scene import (
-    DEFAULT_CUBE_SUBDIV,
-    DEFAULT_PATTERN_PICS_DIR,
-    pixel_pattern_names,
-    radar_data_z_dir,
+    DEFAULT_PLY_PATH,
+    PLATE_X_HALF_M,
+    raw_npz_stem,
+    PLATE_Y_HALF_M,
+    ReflectionConfig,
+    ScatterMesh,
+    ScatterMode,
+    build_scatter_mesh,
+    radar_output_dir,
 )
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
-RAW_RADAR_ROOT = radar_data_z_dir("raw_radar_data")
-RAW_RADAR_DIR = RAW_RADAR_ROOT
-DEFAULT_PICS_DIR = DEFAULT_PATTERN_PICS_DIR
+RAW_RADAR_DIR = radar_output_dir("raw_radar_data")
 DEFAULT_OUTPUT_DIR = RAW_RADAR_DIR
+
+
+# ---------------------------------------------------------------------------
+# 路径配置与 (a, τ) 计算
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PathConfig:
+    scatter_mode: ScatterMode = ScatterMode.FACE_VISIBLE
+    reflection: ReflectionConfig = ReflectionConfig()
+    use_antenna_pattern: bool = True
+
+
+def _channel_positions_at_stop(
+    array: ArrayConfig,
+    stop_index: int,
+    rotation: SarRotationConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    tx_all = tx_positions_at_stop(array, stop_index, rotation)
+    rx_all = rx_positions_at_stop(array, stop_index, rotation)
+    n_ch = array.n_channels
+    tx_ch = np.zeros((n_ch, 3), dtype=np.float64)
+    rx_ch = np.zeros((n_ch, 3), dtype=np.float64)
+    for ch in range(n_ch):
+        ti, ri = channel_tx_rx_index(ch, array)
+        tx_ch[ch] = tx_all[ti]
+        rx_ch[ch] = rx_all[ri]
+    return tx_ch, rx_ch
+
+
+def _require_cuda_device():
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("需要 NVIDIA GPU（PyTorch CUDA 不可用）")
+    return torch.device("cuda")
+
+
+def compute_paths_at_stop(
+    mesh: ScatterMesh,
+    array: ArrayConfig,
+    stop_index: int,
+    rotation: SarRotationConfig,
+    *,
+    path_config: PathConfig,
+    radar: RadarConfig,
+    c: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    import torch
+
+    device = _require_cuda_device()
+    positions = torch.as_tensor(mesh.positions, dtype=torch.float64, device=device)
+    area_w = torch.as_tensor(mesh.area_weight, dtype=torch.float64, device=device)
+    normals = (
+        torch.as_tensor(mesh.normals, dtype=torch.float64, device=device)
+        if mesh.normals is not None
+        else None
+    )
+    mode = path_config.scatter_mode if mesh.mode == ScatterMode.VERTEX else mesh.mode
+
+    tx_ch, rx_ch = _channel_positions_at_stop(array, stop_index, rotation)
+    tx_ch_t = torch.as_tensor(tx_ch, dtype=torch.float64, device=device)
+    rx_ch_t = torch.as_tensor(rx_ch, dtype=torch.float64, device=device)
+    antenna_angle_deg = angle_deg_at_stop(stop_index, rotation)
+
+    n = positions.shape[0]
+    n_ch = tx_ch_t.shape[0]
+    refl = path_config.reflection
+    n_refl = len(refl.points) if refl.enabled else 0
+    n_path = 1 + n_refl
+
+    diff_tx = positions[:, None, :] - tx_ch_t[None, :, :]
+    r_tx = torch.linalg.norm(diff_tx, dim=2).clamp_min(1e-12)
+    diff_rx = positions[:, None, :] - rx_ch_t[None, :, :]
+    r_rx = torch.linalg.norm(diff_rx, dim=2).clamp_min(1e-12)
+
+    if mode == ScatterMode.FACE_VISIBLE and normals is not None:
+        inc = positions[:, None, :] - tx_ch_t[None, :, :]
+        inc_len = torch.linalg.norm(inc, dim=2).clamp_min(1e-12)
+        dot = torch.sum(normals[:, None, :] * inc, dim=2)
+        vis = (dot > 0.0).to(torch.float64)
+        cos_th = torch.abs(dot / inc_len) * vis
+    else:
+        vis = torch.ones((n, n_ch), dtype=torch.float64, device=device)
+        cos_th = vis.clone()
+
+    if radar.use_antenna_pattern:
+        pattern = radar.antenna_pattern
+        half_az = math.radians(pattern.hp_az_deg)
+        half_el = math.radians(pattern.hp_el_deg)
+        beta_az = pattern.az_beam_beta
+        beta_el = pattern.el_beam_beta
+        theta = math.radians(antenna_angle_deg)
+        c_rot, s_rot = math.cos(theta), math.sin(theta)
+
+        def _body_gain(diff):
+            dx, dy, dz = diff[..., 0], diff[..., 1], diff[..., 2]
+            dx_b = c_rot * dx + s_rot * dy
+            dy_b = -s_rot * dx + c_rot * dy
+            dz_b = dz
+            ground = torch.sqrt(dx_b * dx_b + dz_b * dz_b)
+            az = torch.atan2(dx_b, dz_b)
+            el = torch.atan2(dy_b, ground)
+
+            def axis_gain(angle, half_rad, beta):
+                if half_rad <= 0:
+                    return torch.zeros_like(angle)
+                norm_a = torch.abs(angle) / half_rad
+                x = torch.pow(norm_a, beta) * (math.pi / 4.0)
+                out = torch.cos(x) ** 2
+                return torch.where(x >= math.pi / 2.0, torch.zeros_like(out), out)
+
+            return axis_gain(az, half_az, beta_az) * axis_gain(el, half_el, beta_el)
+
+        gains = torch.sqrt(_body_gain(diff_tx) * _body_gain(diff_rx))
+    else:
+        gains = torch.ones((n, n_ch), dtype=torch.float64, device=device)
+
+    a = torch.zeros((n, n_path, n_ch), dtype=torch.float64, device=device)
+    tau = torch.zeros((n, n_path, n_ch), dtype=torch.float64, device=device)
+    tau[:, 0, :] = (r_tx + r_rx) / c
+    a[:, 0, :] = area_w[:, None] * cos_th * vis * gains / (r_tx * r_rx)
+
+    if n_refl > 0:
+        refl_pts = torch.as_tensor(refl.points, dtype=torch.float64, device=device)
+        coeffs = torch.as_tensor(refl.coefficients, dtype=torch.float64, device=device)
+        for ri in range(n_refl):
+            rp = refl_pts[ri]
+            d_pr = torch.linalg.norm(positions - rp, dim=1).clamp_min(1e-12)
+            d_rr = torch.linalg.norm(rx_ch_t - rp, dim=1).clamp_min(1e-12)
+            p_idx = 1 + ri
+            tau[:, p_idx, :] = (r_tx + d_pr[:, None] + d_rr[None, :]) / c
+            a[:, p_idx, :] = coeffs[ri] * area_w[:, None] * cos_th * vis * gains / (
+                r_tx * d_pr[:, None] * d_rr[None, :]
+            )
+
+    return a.cpu().numpy(), tau.cpu().numpy()
+
+
+# ---------------------------------------------------------------------------
+# FMCW 合成
+# ---------------------------------------------------------------------------
+
+
+def synthesize_adc_from_paths(
+    a: np.ndarray,
+    tau: np.ndarray,
+    radar: RadarConfig,
+) -> np.ndarray:
+    import torch
+
+    if a.shape != tau.shape or a.ndim != 3:
+        raise ValueError(f"期望 a/tau 同为 (N, n_path, n_ch)，得到 {a.shape} / {tau.shape}")
+
+    device = _require_cuda_device()
+    a_t = torch.as_tensor(a, dtype=torch.float64, device=device)
+    tau_t = torch.as_tensor(tau, dtype=torch.float64, device=device)
+    t = torch.as_tensor(adc_time_axis(radar), dtype=torch.float64, device=device)
+    b = 2.0 * np.pi * radar.f_start_hz * tau_t - np.pi * radar.slope_hz_per_s * tau_t * tau_t
+    c_coef = 2.0 * np.pi * radar.slope_hz_per_s * tau_t
+    phase = b.unsqueeze(-1) + c_coef.unsqueeze(-1) * t
+    data = torch.sum(a_t.unsqueeze(-1) * torch.exp(1j * phase), dim=(0, 1))
+    return data.cpu().numpy().astype(np.complex64)
+
+
+# ---------------------------------------------------------------------------
+# (a, τ) 停点缓存
+# ---------------------------------------------------------------------------
+
+
+def _ply_digest(ply_path: str) -> str:
+    if not ply_path:
+        return ""
+    p = Path(ply_path)
+    if not p.is_file():
+        return ""
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def path_cache_meta(
+    mesh: ScatterMesh,
+    array: ArrayConfig,
+    rotation: SarRotationConfig,
+    path_config: PathConfig,
+) -> dict[str, Any]:
+    refl = path_config.reflection
+    return {
+        "ply_path": mesh.ply_path,
+        "ply_digest": _ply_digest(mesh.ply_path),
+        "scatter_mode": mesh.mode.value,
+        "n_scatterers": mesh.n_scatterers,
+        "reflection_enabled": refl.enabled,
+        "reflection_points": list(refl.points),
+        "reflection_coefficients": list(refl.coefficients),
+        "n_stops": rotation.n_stops,
+        "step_deg": rotation.step_deg,
+        "start_angle_rad": rotation.start_angle_rad,
+        "n_channels": array.n_channels,
+    }
+
+
+def path_cache_valid(cache_path: Path, meta: dict[str, Any]) -> bool:
+    if not cache_path.is_file():
+        return False
+    meta_path = cache_path.with_suffix(".meta.json")
+    if not meta_path.is_file():
+        return False
+    try:
+        stored = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    return stored == meta
+
+
+def save_path_cache(
+    cache_path: Path,
+    a_all: np.ndarray,
+    tau_all: np.ndarray,
+    meta: dict[str, Any],
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache_path, a=a_all.astype(np.float64), tau=tau_all.astype(np.float64))
+    cache_path.with_suffix(".meta.json").write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def load_path_cache(cache_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    archive = np.load(cache_path)
+    return archive["a"], archive["tau"]
+
+
+# ---------------------------------------------------------------------------
+# 公共 API
+# ---------------------------------------------------------------------------
 
 
 def ensure_output_dirs() -> None:
     RAW_RADAR_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _gpu_status_label(use_gpu: bool) -> str:
-    if not use_gpu:
-        return "False"
-    try:
-        import torch
+def _cuda_device_name() -> str:
+    import torch
 
-        if torch.cuda.is_available():
-            return torch.cuda.get_device_name(0)
-    except ImportError:
-        pass
-    return "unavailable"
+    _require_cuda_device()
+    return torch.cuda.get_device_name(0)
 
 
 def load_sar_cube(path: Path) -> tuple[np.ndarray, float]:
-    """
-    读取原始 SAR npz。
-
-    返回 ((n_stops, 8, n_adc) complex64, start_angle_rad)。
-    """
     archive = np.load(path)
     data = archive["data"]
     if data.ndim != 3 or data.shape[1] != 8:
         raise ValueError(f"期望 (n_stops, 8, n_adc)，得到 {data.shape}")
     start_angle_rad = (
-        float(archive["start_angle_rad"])
-        if "start_angle_rad" in archive.files
-        else 0.0
+        float(archive["start_angle_rad"]) if "start_angle_rad" in archive.files else 0.0
     )
     return np.asarray(data, dtype=np.complex64), start_angle_rad
 
 
-def _simulate_channels_for_one_tx(
-    radar: RadarConfig,
-    array: ArrayConfig,
-    targets: Sequence[PointTarget],
-    tx_pos: np.ndarray,
-    rx_positions: np.ndarray,
-    antenna_angle_deg: float,
-    c: float = C_LIGHT,
-) -> np.ndarray:
-    """单 TX → (n_rx, n_adc) complex64。"""
-    rx_positions = np.asarray(rx_positions, dtype=np.float64)
-    if rx_positions.shape != (array.n_rx, 3):
-        raise ValueError(f"rx_positions must be ({array.n_rx}, 3)")
-
-    t = adc_time_axis(radar)
-    if t[-1] > radar.ramp_time_s:
-        raise ValueError(
-            f"ADC 末点 {t[-1]*1e6:.3f} us 超出 ramp {radar.ramp_time_s*1e6:.3f} us"
-        )
-
-    targets_xyz = targets_to_xyz(list(targets))
-    target_amp = np.array([tg.amplitude for tg in targets], dtype=np.float64)
-    tx_pos = np.asarray(tx_pos, dtype=np.float64)
-    pattern = radar.antenna_pattern
-    r_tx = np.linalg.norm(targets_xyz - tx_pos, axis=1)
-
-    data = np.zeros((array.n_rx, radar.n_adc_samples), dtype=np.complex64)
-
-    for rx_j, ant in enumerate(rx_positions):
-        r_rx = np.linalg.norm(targets_xyz - ant, axis=1)
-        path_len = r_tx + r_rx
-        delta_t = path_len / c
-
-        b = (
-            2.0 * np.pi * radar.f_start_hz * delta_t
-            - np.pi * radar.slope_hz_per_s * delta_t * delta_t
-        )
-        c_coef = 2.0 * np.pi * radar.slope_hz_per_s * delta_t
-        phase = b[:, np.newaxis] + c_coef[:, np.newaxis] * t[np.newaxis, :]
-
-        if radar.use_antenna_pattern:
-            gains = np.empty(targets_xyz.shape[0], dtype=np.float64)
-            for i, tgt in enumerate(targets_xyz):
-                g, _, _ = monostatic_channel_gain(
-                    tx_pos,
-                    ant,
-                    tgt,
-                    pattern,
-                    antenna_angle_deg=antenna_angle_deg,
-                )
-                gains[i] = g
-        else:
-            gains = np.ones(targets_xyz.shape[0], dtype=np.float64)
-
-        amp = target_amp * gains / (r_tx * r_rx)
-        data[rx_j, :] = np.sum(amp[:, np.newaxis] * np.exp(1j * phase), axis=0).astype(
-            np.complex64
-        )
-
-    return data
-
-
-def _simulate_one_stop(
-    radar: RadarConfig,
-    array: ArrayConfig,
-    targets: Sequence[PointTarget],
-    stop_index: int,
-    rotation: SarRotationConfig,
-    c: float = C_LIGHT,
-) -> np.ndarray:
-    """一个停点：TX1 + TX2 → (8, n_adc)。"""
-    antenna_angle_deg = angle_deg_at_stop(stop_index, rotation)
-    tx_pos = tx_positions_at_stop(array, stop_index, rotation)
-    rx_pos = rx_positions_at_stop(array, stop_index, rotation)
-    frame = np.zeros((array.n_channels, radar.n_adc_samples), dtype=np.complex64)
-
-    for tx_i in range(array.n_tx):
-        block = _simulate_channels_for_one_tx(
-            radar,
-            array,
-            targets,
-            tx_pos[tx_i],
-            rx_pos,
-            antenna_angle_deg,
-            c=c,
-        )
-        frame[tx_i * array.n_rx : (tx_i + 1) * array.n_rx, :] = block
-
-    return frame
-
-
-@dataclass
-class _GpuSimState:
-    targets_xyz: object
-    target_amp: object
-    t_adc: object
-    f_start_hz: float
-    slope_hz_per_s: float
-    c_light: float
-    use_antenna_pattern: bool
-    half_az_rad: float
-    half_el_rad: float
-    beta_az: float
-    beta_el: float
-    device: object
-
-
-def _try_create_gpu_sim_state(
-    radar: RadarConfig,
-    targets: Sequence[PointTarget],
-    c: float = C_LIGHT,
-) -> _GpuSimState | None:
-    try:
-        import torch
-    except ImportError as exc:
-        print(f"PyTorch 未安装（{exc}），回退 CPU。", flush=True)
-        return None
-    if not torch.cuda.is_available():
-        return None
-
-    targets_xyz = targets_to_xyz(list(targets))
-    target_amp = np.array([tg.amplitude for tg in targets], dtype=np.float64)
-    t_adc = adc_time_axis(radar)
-    pattern = radar.antenna_pattern
-    dev = torch.device("cuda")
-    return _GpuSimState(
-        targets_xyz=torch.as_tensor(targets_xyz, dtype=torch.float64, device=dev),
-        target_amp=torch.as_tensor(target_amp, dtype=torch.float64, device=dev),
-        t_adc=torch.as_tensor(t_adc, dtype=torch.float64, device=dev),
-        f_start_hz=radar.f_start_hz,
-        slope_hz_per_s=radar.slope_hz_per_s,
-        c_light=c,
-        use_antenna_pattern=radar.use_antenna_pattern,
-        half_az_rad=math.radians(pattern.hp_az_deg),
-        half_el_rad=math.radians(pattern.hp_el_deg),
-        beta_az=pattern.az_beam_beta,
-        beta_el=pattern.el_beam_beta,
-        device=dev,
+def describe_scatter_mesh(mesh: ScatterMesh) -> str:
+    xyz = mesh.positions
+    return "\n".join(
+        [
+            f"scatter mesh @ {Path(mesh.ply_path).name if mesh.ply_path else '(targets)'}",
+            f"  mode={mesh.mode.value}, scatterers={mesh.n_scatterers}",
+            (
+                f"  bbox x[{xyz[:, 0].min():.3f},{xyz[:, 0].max():.3f}] "
+                f"y[{xyz[:, 1].min():.3f},{xyz[:, 1].max():.3f}] "
+                f"z[{xyz[:, 2].min():.3f},{xyz[:, 2].max():.3f}]"
+            ),
+        ]
     )
 
 
-def _axis_gain_torch(angle_rad, half_power_rad: float, beta: float):
-    import torch
-
-    if half_power_rad <= 0:
-        return torch.zeros_like(angle_rad)
-    normalized = torch.abs(angle_rad) / half_power_rad
-    x = torch.pow(normalized, beta) * (math.pi / 4.0)
-    out = torch.cos(x) ** 2
-    return torch.where(x >= math.pi / 2.0, torch.zeros_like(out), out)
-
-
-def _rotate_delta_body_torch(dx, dy, dz, antenna_angle_deg: float):
-    import torch
-
-    theta = math.radians(antenna_angle_deg)
-    c = math.cos(theta)
-    s = math.sin(theta)
-    return c * dx + s * dy, -s * dx + c * dy, dz
-
-
-def _direction_gain_torch(
-    ant_xyz,
-    targets_xyz,
-    half_az_rad: float,
-    half_el_rad: float,
-    beta_az: float,
-    beta_el: float,
-    antenna_angle_deg: float,
-):
-    import torch
-
-    diff = targets_xyz - ant_xyz
-    dx, dy, dz = diff[:, 0], diff[:, 1], diff[:, 2]
-    dx, dy, dz = _rotate_delta_body_torch(dx, dy, dz, antenna_angle_deg)
-    ground = torch.sqrt(dx * dx + dz * dz)
-    az = torch.atan2(dx, dz)
-    el = torch.atan2(dy, ground)
-    return _axis_gain_torch(az, half_az_rad, beta_az) * _axis_gain_torch(
-        el, half_el_rad, beta_el
-    )
-
-
-def _direction_gain_rx_torch(
-    rx_xyz,
-    targets_xyz,
-    half_az_rad: float,
-    half_el_rad: float,
-    beta_az: float,
-    beta_el: float,
-    antenna_angle_deg: float,
-):
-    import torch
-
-    diff = targets_xyz[:, None, :] - rx_xyz[None, :, :]
-    dx, dy, dz = diff[..., 0], diff[..., 1], diff[..., 2]
-    dx, dy, dz = _rotate_delta_body_torch(dx, dy, dz, antenna_angle_deg)
-    ground = torch.sqrt(dx * dx + dz * dz)
-    az = torch.atan2(dx, dz)
-    el = torch.atan2(dy, ground)
-    return _axis_gain_torch(az, half_az_rad, beta_az) * _axis_gain_torch(
-        el, half_el_rad, beta_el
-    )
-
-
-def _simulate_channels_for_one_tx_gpu(
-    gpu: _GpuSimState,
-    tx_pos: np.ndarray,
-    rx_positions: np.ndarray,
-    antenna_angle_deg: float,
-) -> np.ndarray:
-    import torch
-
-    tx = torch.as_tensor(tx_pos, dtype=torch.float64, device=gpu.device)
-    rx = torch.as_tensor(rx_positions, dtype=torch.float64, device=gpu.device)
-
-    diff_tx = gpu.targets_xyz - tx
-    r_tx = torch.linalg.norm(diff_tx, dim=1)
-    diff_rx = gpu.targets_xyz[:, None, :] - rx[None, :, :]
-    r_rx = torch.linalg.norm(diff_rx, dim=-1)
-    path_len = r_tx[:, None] + r_rx
-    delta_t = path_len / gpu.c_light
-
-    b = (
-        2.0 * math.pi * gpu.f_start_hz * delta_t
-        - math.pi * gpu.slope_hz_per_s * delta_t * delta_t
-    )
-    c_coef = 2.0 * math.pi * gpu.slope_hz_per_s * delta_t
-    phase = b.unsqueeze(-1) + c_coef.unsqueeze(-1) * gpu.t_adc
-
-    if gpu.use_antenna_pattern:
-        g_tx = _direction_gain_torch(
-            tx,
-            gpu.targets_xyz,
-            gpu.half_az_rad,
-            gpu.half_el_rad,
-            gpu.beta_az,
-            gpu.beta_el,
-            antenna_angle_deg,
-        )
-        g_rx = _direction_gain_rx_torch(
-            rx,
-            gpu.targets_xyz,
-            gpu.half_az_rad,
-            gpu.half_el_rad,
-            gpu.beta_az,
-            gpu.beta_el,
-            antenna_angle_deg,
-        )
-        gains = torch.sqrt(g_tx[:, None] * g_rx)
-    else:
-        gains = torch.ones_like(r_rx)
-
-    amp = gpu.target_amp[:, None] * gains / (r_tx[:, None] * r_rx)
-    data = torch.sum(amp.unsqueeze(-1) * torch.exp(1j * phase), dim=0)
-    return data.cpu().numpy().astype(np.complex64)
-
-
-def _simulate_one_stop_gpu(
-    gpu: _GpuSimState,
-    array: ArrayConfig,
-    stop_index: int,
-    rotation: SarRotationConfig,
-) -> np.ndarray:
-    antenna_angle_deg = angle_deg_at_stop(stop_index, rotation)
-    tx_pos = tx_positions_at_stop(array, stop_index, rotation)
-    rx_pos = rx_positions_at_stop(array, stop_index, rotation)
-    frame = np.zeros((array.n_channels, gpu.t_adc.shape[0]), dtype=np.complex64)
-    for tx_i in range(array.n_tx):
-        block = _simulate_channels_for_one_tx_gpu(
-            gpu, tx_pos[tx_i], rx_pos, antenna_angle_deg
-        )
-        frame[tx_i * array.n_rx : (tx_i + 1) * array.n_rx, :] = block
-    return frame
-
-
-def _simulate_sar_rotation_cube_gpu(
-    radar: RadarConfig,
-    array: ArrayConfig,
-    rotation: SarRotationConfig,
-    targets: Sequence[PointTarget],
-    c: float = C_LIGHT,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
-) -> np.ndarray:
-    import torch
-
-    gpu = _try_create_gpu_sim_state(radar, targets, c=c)
-    if gpu is None:
-        print("GPU 不可用，回退 CPU。", flush=True)
-        return simulate_sar_rotation_cube(
-            radar=radar,
-            array=array,
-            rotation=rotation,
-            targets=targets,
-            c=c,
-            progress_callback=progress_callback,
-            use_gpu=False,
-        )
-
-    cube = np.zeros(
-        (rotation.n_stops, array.n_channels, radar.n_adc_samples),
-        dtype=np.complex64,
-    )
-    for k in range(1, rotation.n_stops + 1):
-        cube[k - 1] = _simulate_one_stop_gpu(gpu, array, k, rotation)
-        if progress_callback is not None:
-            progress_callback(k, rotation.n_stops)
-    return cube
-
-
-def simulate_sar_rotation_cube(
+def simulate_mesh_rotation_cube(
+    mesh: ScatterMesh,
+    *,
     radar: RadarConfig | None = None,
     array: ArrayConfig | None = None,
     rotation: SarRotationConfig | None = None,
-    targets: Sequence[PointTarget] | None = None,
+    path_config: PathConfig | None = None,
     c: float = C_LIGHT,
     progress_callback: Optional[Callable[[int, int], None]] = None,
-    *,
-    use_gpu: bool = False,
+    path_cache_path: Path | None = None,
 ) -> np.ndarray:
-    """停采转台 SAR：返回 (n_stops, 8, n_adc_samples) complex64。"""
     radar = radar or RadarConfig()
     array = array or ArrayConfig()
     rotation = rotation or SarRotationConfig()
-    if targets is None:
-        raise ValueError("targets 不能为 None")
-    target_list = list(targets)
+    path_config = path_config or PathConfig(scatter_mode=mesh.mode)
 
-    if use_gpu:
-        return _simulate_sar_rotation_cube_gpu(
-            radar,
-            array,
-            rotation,
-            target_list,
-            c=c,
-            progress_callback=progress_callback,
-        )
+    meta = path_cache_meta(mesh, array, rotation, path_config)
+    a_all = tau_all = None
+    if path_cache_path is not None and path_cache_valid(path_cache_path, meta):
+        a_all, tau_all = load_path_cache(path_cache_path)
+        print(f"  path cache hit: {path_cache_path}", flush=True)
 
-    cube = np.zeros(
-        (rotation.n_stops, array.n_channels, radar.n_adc_samples),
-        dtype=np.complex64,
-    )
+    cube = np.zeros((rotation.n_stops, array.n_channels, radar.n_adc_samples), dtype=np.complex64)
 
-    for k in range(1, rotation.n_stops + 1):
-        cube[k - 1] = _simulate_one_stop(
-            radar, array, target_list, k, rotation, c=c
-        )
-        if progress_callback is not None:
-            progress_callback(k, rotation.n_stops)
+    if a_all is None:
+        a_list: list[np.ndarray] = []
+        tau_list: list[np.ndarray] = []
+        for k in range(1, rotation.n_stops + 1):
+            a_k, tau_k = compute_paths_at_stop(
+                mesh, array, k, rotation, path_config=path_config, radar=radar, c=c
+            )
+            a_list.append(a_k)
+            tau_list.append(tau_k)
+            cube[k - 1] = synthesize_adc_from_paths(a_k, tau_k, radar)
+            if progress_callback is not None:
+                progress_callback(k, rotation.n_stops)
+        if path_cache_path is not None:
+            save_path_cache(path_cache_path, np.stack(a_list), np.stack(tau_list), meta)
+            print(f"  path cache saved: {path_cache_path}", flush=True)
+    else:
+        for k in range(rotation.n_stops):
+            cube[k] = synthesize_adc_from_paths(a_all[k], tau_all[k], radar)
+            if progress_callback is not None:
+                progress_callback(k + 1, rotation.n_stops)
 
     return cube
 
@@ -463,155 +409,97 @@ def save_raw_cube(
 
 
 def simulate_one(
-    pattern_name: str,
     *,
     output_dir: Path,
-    pics_dir: Path | None = None,
-    cube_subdiv: int = DEFAULT_CUBE_SUBDIV,
+    ply_path: Path | None = None,
     start_angle_rad: float = 0.0,
-    use_gpu: bool = False,
+    scatter_mode: ScatterMode = ScatterMode.FACE_VISIBLE,
+    reflection: ReflectionConfig | None = None,
+    path_cache_path: Path | None = None,
 ) -> tuple[np.ndarray, Path, float]:
-    targets = pixel_pattern_scene(
-        pattern_name, pics_dir=pics_dir, cube_subdiv=cube_subdiv
-    )
+    ply = ply_path or DEFAULT_PLY_PATH
+    mesh = build_scatter_mesh(ply, mode=scatter_mode)
     radar = RadarConfig()
     array = ArrayConfig()
     rotation = SarRotationConfig(start_angle_rad=start_angle_rad)
+    refl = reflection or ReflectionConfig()
+    path_config = PathConfig(scatter_mode=scatter_mode, reflection=refl)
 
-    print(
-        f"    scatterers: {len(targets)}, "
-        f"cube_subdiv={cube_subdiv}, stops={rotation.n_stops}",
-        flush=True,
-    )
+    print(describe_scatter_mesh(mesh))
+    if refl.enabled:
+        print(f"  reflection: {len(refl.points)} points", flush=True)
+    out_stem = raw_npz_stem(ply)
+    print(f"    stops={rotation.n_stops}, output={out_stem}.npz", flush=True)
 
     def progress(k: int, n: int) -> None:
         if k == 1 or k == n or k % 100 == 0:
-            print(
-                f"    stop {k}/{n} ({angle_deg_at_stop(k, rotation):.1f} deg)",
-                flush=True,
-            )
+            print(f"    stop {k}/{n} ({angle_deg_at_stop(k, rotation):.1f} deg)", flush=True)
 
     t0 = time.perf_counter()
-    cube = simulate_sar_rotation_cube(
+    cube = simulate_mesh_rotation_cube(
+        mesh,
         radar=radar,
         array=array,
         rotation=rotation,
-        targets=targets,
+        path_config=path_config,
         progress_callback=progress,
-        use_gpu=use_gpu,
+        path_cache_path=path_cache_path,
     )
-    path = save_raw_cube(
-        cube,
-        f"{pattern_name}.npz",
-        output_dir=output_dir,
-        start_angle_rad=start_angle_rad,
-    )
-    elapsed = time.perf_counter() - t0
-    return cube, path, elapsed
+    path = save_raw_cube(cube, f"{out_stem}.npz", output_dir=output_dir, start_angle_rad=start_angle_rad)
+    return cube, path, time.perf_counter() - t0
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="批量 pixel_pattern 仿真 → output/raw_radar_data_z*"
-    )
+    parser = argparse.ArgumentParser(description="金属板 PLY 场景 SAR 仿真 → output/raw_radar_data/")
+    parser.add_argument("--ply", type=Path, default=DEFAULT_PLY_PATH)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
-        "--pattern",
-        nargs="*",
-        default=None,
-        metavar="NAME",
-        help="图案名（默认 circle）",
+        "--scatter-mode",
+        type=str,
+        choices=[m.value for m in ScatterMode],
+        default=ScatterMode.FACE_VISIBLE.value,
     )
-    parser.add_argument(
-        "--pics-dir",
-        type=Path,
-        default=DEFAULT_PICS_DIR,
-        metavar="DIR",
-        help=f"GT npy 目录（默认 {DEFAULT_PICS_DIR}）",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help=f"输出目录（默认 {DEFAULT_OUTPUT_DIR}）",
-    )
-    parser.add_argument(
-        "--cube-subdiv",
-        type=int,
-        default=DEFAULT_CUBE_SUBDIV,
-        metavar="N",
-        help=f"每 1 cm 块散射点细分 N³（默认 {DEFAULT_CUBE_SUBDIV}=单点）",
-    )
-    parser.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="已存在 {NAME}.npz 则跳过",
-    )
-    parser.add_argument(
-        "--start-angle-rad",
-        type=float,
-        default=0.0,
-        metavar="RAD",
-        help="第 1 停转角 (rad)，默认 0",
-    )
-    parser.add_argument(
-        "--gpu",
-        action="store_true",
-        help="使用 NVIDIA GPU (PyTorch CUDA) 加速前向仿真",
-    )
-    parser.add_argument(
-        "--cpu",
-        action="store_true",
-        help="强制 CPU（覆盖 --gpu）",
-    )
+    parser.add_argument("--reflection", action="store_true")
+    parser.add_argument("--path-cache", type=Path, default=None, metavar="NPZ")
+    parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--start-angle-rad", type=float, default=0.0, metavar="RAD")
     args = parser.parse_args()
 
     if not (0.0 <= args.start_angle_rad < 2.0 * math.pi):
         raise SystemExit("start-angle-rad 须在 [0, 2π) 内")
-    if args.cube_subdiv < 1:
-        raise SystemExit("cube-subdiv 须 >= 1")
+    if not args.ply.is_file():
+        raise SystemExit(f"PLY 不存在: {args.ply.resolve()}")
 
-    pics_dir = args.pics_dir
     output_dir = args.output_dir
-
-    names = args.pattern if args.pattern else pixel_pattern_names(pics_dir)
-    if not names:
-        raise SystemExit("未找到图案 circle，请先运行 test_code/generate_pattern_pics.py")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"simulate {len(names)} patterns → {output_dir.resolve()}")
-    print(f"  pics   : {pics_dir.resolve()}")
-    use_gpu = args.gpu and not args.cpu
-    print(
-        f"  cube_subdiv={args.cube_subdiv}, gpu={_gpu_status_label(use_gpu)}"
+    out_path = output_dir / f"{raw_npz_stem(args.ply)}.npz"
+    scatter_mode = ScatterMode(args.scatter_mode)
+    reflection = (
+        ReflectionConfig.conveyor_belt_grid(
+            x_range=(-PLATE_X_HALF_M - 0.05, PLATE_X_HALF_M + 0.05),
+            y_range=(-PLATE_Y_HALF_M - 0.05, PLATE_Y_HALF_M + 0.05),
+        )
+        if args.reflection
+        else ReflectionConfig()
     )
 
-    n_done = 0
-    n_skip = 0
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"simulate metal_plate → {output_dir.resolve()}")
+    print(f"  ply={args.ply.resolve()}, mode={scatter_mode.value}")
+    print(f"  reflection={args.reflection}, gpu={_cuda_device_name()}")
 
-    for i, name in enumerate(names, 1):
-        out_path = output_dir / f"{name}.npz"
-        if args.skip_existing and out_path.is_file():
-            n_skip += 1
-            print(f"[{i}/{len(names)}] {name}: skip (exists)", flush=True)
-            continue
+    if args.skip_existing and out_path.is_file():
+        print(f"skip (exists): {out_path}", flush=True)
+        return
 
-        print(f"[{i}/{len(names)}] {name} ...", flush=True)
-
-        cube, path, elapsed = simulate_one(
-            name,
-            output_dir=output_dir,
-            pics_dir=pics_dir,
-            cube_subdiv=args.cube_subdiv,
-            start_angle_rad=args.start_angle_rad,
-            use_gpu=use_gpu,
-        )
-        n_done += 1
-        print(f"    {name}: saved", flush=True)
-
-    for path in output_dir.glob("*.json"):
-        path.unlink()
-
-    print(f"done: {n_done} saved, {n_skip} skipped, {len(names)} total")
+    cube, path, elapsed = simulate_one(
+        output_dir=output_dir,
+        ply_path=args.ply,
+        start_angle_rad=args.start_angle_rad,
+        scatter_mode=scatter_mode,
+        reflection=reflection,
+        path_cache_path=args.path_cache,
+    )
+    print(f"saved {path}  shape={cube.shape}  ({elapsed:.1f}s)", flush=True)
 
 
 if __name__ == "__main__":
